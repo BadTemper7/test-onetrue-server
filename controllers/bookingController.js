@@ -1647,11 +1647,22 @@ exports.submitBookingPayment = submitBookingPayment;
 const recordAdminCashPayment = async (req, res) => {
     const booking = await Booking_js_1.default.findById(req.params.id);
     if (!booking) return res.status(404).json({ success: false, message: "Booking not found." });
-    if (!["gate_out_requested", "gate_out_approved"].includes(booking.status) || !booking.outDate) {
-        return res.status(400).json({ success: false, message: "Cash payment can only be recorded after Date Out and final billing are available." });
+    if (booking.status !== "gate_out_requested" || !booking.outDate) {
+        return res.status(400).json({ success: false, message: "Cash payment can only be recorded for a pending Gate-Out request after Date Out and final billing are available." });
     }
     if (booking.billingStatus === "paid_approved") {
         return res.status(409).json({ success: false, message: "This booking is already marked as paid." });
+    }
+    const existingPaymentType = String(booking.paymentTypeSnapshot?.type || "").trim().toLowerCase();
+    const hasOnlinePaymentProof = Array.isArray(booking.paymentProofs) && booking.paymentProofs.length > 0;
+    const hasLegacyOnlineSubmission = Boolean(booking.paymentSubmittedAt) &&
+        existingPaymentType !== "cash" &&
+        Number(booking.cashReceived || 0) <= 0;
+    const hasExistingOnlinePayment = ["bank", "ewallet"].includes(existingPaymentType) ||
+        hasOnlinePaymentProof ||
+        hasLegacyOnlineSubmission;
+    if (hasExistingOnlinePayment) {
+        return res.status(409).json({ success: false, message: "Cash payment is disabled because an online payment already exists for this booking." });
     }
     booking.isVatApplicable = ![false, "false", "0", 0, "non_vat"].includes(req.body.isVatApplicable);
     const billingResult = await (0, exports.computeBookingBilling)(booking, { persist: true });
