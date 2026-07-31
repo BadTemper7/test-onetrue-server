@@ -18,6 +18,7 @@ const emailTemplates_js_1 = require("../utils/emailTemplates.js");
 const socket_js_1 = require("../socket/socket.js");
 const bookingNumber_js_1 = require("../utils/bookingNumber.js");
 const billingDays_js_1 = require("../utils/billingDays.js");
+const notificationService_js_1 = require("../utils/notificationService.js");
 const ACTIVE_BOOKING_STATUSES = [
     "approved_area_assigned",
     "gate_in_approved",
@@ -526,6 +527,22 @@ const notifyEmail = async ({ to, subject, title, booking, message, details = [],
 };
 const notifyClient = async (booking, title, message, details = [], options = {}) => {
     const populated = booking.client?.email ? booking : await booking.populate("client", "name email companyName");
+    const recipient = populated.client?._id || populated.client;
+    await (0, notificationService_js_1.createClientNotification)({
+        recipient,
+        type: options.notificationType || "booking",
+        title,
+        message,
+        booking: populated._id || null,
+        bookingReference: populated.bookingReference || populated.bookingNumber || "",
+        containerNumber: populated.containerNumber || "",
+        actionPath: options.actionPath || "/booking-history",
+        metadata: {
+            status: populated.status || "",
+            billingStatus: populated.billingStatus || "",
+            details,
+        },
+    });
     await notifyEmail({
         to: populated.client?.email,
         subject: `${title} - ${populated.bookingReference}`,
@@ -1623,6 +1640,18 @@ const addBookingCongestionSurcharge = async (req, res) => {
     const payload = safeBooking(booking);
     (0, socket_js_1.emitToAdmins)("booking:congestion_surcharge_added", payload);
     (0, socket_js_1.emitToUser)(booking.client?._id || booking.client, "booking:congestion_surcharge_added", payload);
+    await (0, notificationService_js_1.createClientNotification)({
+        recipient: booking.client?._id || booking.client,
+        type: "billing_charge_added",
+        title: "Congestion surcharge added",
+        message: billingResult
+            ? `A congestion surcharge was added. Your updated bill is PHP ${billingResult.total.toLocaleString()}.`
+            : "A congestion surcharge was added and will be included when your final bill is computed.",
+        booking: booking._id,
+        bookingReference: booking.bookingReference || booking.bookingNumber || "",
+        containerNumber: booking.containerNumber || "",
+        actionPath: "/booking-history",
+    });
     return res.status(201).json({ success: true, message: "Congestion Surcharge added.", booking: payload });
 };
 exports.addBookingCongestionSurcharge = addBookingCongestionSurcharge;
@@ -1667,6 +1696,18 @@ const addBookingAdditionalCharge = async (req, res) => {
     const payload = safeBooking(booking);
     (0, socket_js_1.emitToAdmins)("booking:additional_charge_added", payload);
     (0, socket_js_1.emitToUser)(booking.client?._id || booking.client, "booking:additional_charge_added", payload);
+    await (0, notificationService_js_1.createClientNotification)({
+        recipient: booking.client?._id || booking.client,
+        type: "billing_charge_added",
+        title: "Additional billing item added",
+        message: billingResult
+            ? `${description} was added to your bill. Updated total: PHP ${billingResult.total.toLocaleString()}.`
+            : `${description} was added and will be included when your final bill is computed.`,
+        booking: booking._id,
+        bookingReference: booking.bookingReference || booking.bookingNumber || "",
+        containerNumber: booking.containerNumber || "",
+        actionPath: "/booking-history",
+    });
     return res.status(201).json({ success: true, message: "Additional billing charge added.", booking: payload });
 };
 exports.addBookingAdditionalCharge = addBookingAdditionalCharge;
@@ -1702,6 +1743,18 @@ const deleteBookingAdditionalCharge = async (req, res) => {
     const payload = safeBooking(booking);
     (0, socket_js_1.emitToAdmins)("booking:additional_charge_deleted", payload);
     (0, socket_js_1.emitToUser)(booking.client?._id || booking.client, "booking:additional_charge_deleted", payload);
+    await (0, notificationService_js_1.createClientNotification)({
+        recipient: booking.client?._id || booking.client,
+        type: "billing_charge_removed",
+        title: "Additional billing item removed",
+        message: billingResult
+            ? `${description} was removed from your bill. Updated total: PHP ${billingResult.total.toLocaleString()}.`
+            : `${description} was removed from your pending billing items.`,
+        booking: booking._id,
+        bookingReference: booking.bookingReference || booking.bookingNumber || "",
+        containerNumber: booking.containerNumber || "",
+        actionPath: "/booking-history",
+    });
     return res.json({ success: true, message: "Additional billing charge removed.", booking: payload });
 };
 exports.deleteBookingAdditionalCharge = deleteBookingAdditionalCharge;
