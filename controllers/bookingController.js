@@ -3,7 +3,7 @@ var __importDefault = (this && this.__importDefault) || function (mod) {
     return (mod && mod.__esModule) ? mod : { "default": mod };
 };
 Object.defineProperty(exports, "__esModule", { value: true });
-exports.getBookingSummary = exports.getPublicBookingByNumber = exports.relocateBooking = exports.completeBookingGateOut = exports.cancelBooking = exports.rejectBookingGateOut = exports.approveBookingGateOut = exports.requestBookingGateOut = exports.rejectBookingPayment = exports.approveBookingPayment = exports.recordAdminCashPayment = exports.submitBookingPayment = exports.deleteBookingAdditionalCharge = exports.addBookingCongestionSurcharge = exports.getBookingCongestionSurchargeOption = exports.addBookingAdditionalCharge = exports.updateBookingRateClassification = exports.updateBookingBillingOperation = exports.markBookingStored = exports.rejectBookingGateIn = exports.approveBookingGateIn = exports.rejectBooking = exports.approveBooking = exports.deleteBooking = exports.getAdminBooking = exports.listAdminBookings = exports.getClientBooking = exports.listClientBookings = exports.resubmitClientBooking = exports.createClientBooking = exports.getYardBlockSlots = exports.computeBookingBilling = void 0;
+exports.getBookingSummary = exports.getPublicBookingByNumber = exports.relocateBooking = exports.completeBookingGateOut = exports.cancelBooking = exports.rejectBookingGateOut = exports.approveBookingGateOut = exports.requestBookingGateOut = exports.rejectBookingPayment = exports.approveBookingPayment = exports.recordAdminCashPayment = exports.submitBookingPayment = exports.deleteBookingAdditionalCharge = exports.addBookingCongestionSurcharge = exports.getBookingCongestionSurchargeOption = exports.addBookingAdditionalCharge = exports.updateBookingRateClassification = exports.updateBookingBillingOperation = exports.markBookingStored = exports.rejectBookingGateIn = exports.approveBookingGateIn = exports.rejectBooking = exports.approveBooking = exports.deleteBooking = exports.getAdminBookingCalendar = exports.getAdminBooking = exports.listAdminBookings = exports.getClientBooking = exports.listClientBookings = exports.resubmitClientBooking = exports.createClientBooking = exports.getYardBlockSlots = exports.computeBookingBilling = void 0;
 const Booking_js_1 = __importDefault(require("../models/Booking.js"));
 const PreAdvice_js_1 = __importDefault(require("../models/PreAdvice.js"));
 const InventoryContainer_js_1 = __importDefault(require("../models/InventoryContainer.js"));
@@ -186,6 +186,35 @@ const ensureBookingHourCapacity = async (value, excludeBookingId = null) => {
         error.statusCode = 409;
         throw error;
     }
+};
+const buildCalendarDayRange = (dateValue, timezoneOffsetMinutes = 0) => {
+    const match = String(dateValue || "").match(/^(\d{4})-(\d{2})-(\d{2})$/);
+    if (!match)
+        return null;
+    const [, year, month, day] = match;
+    const safeOffset = Number.isFinite(Number(timezoneOffsetMinutes)) ? Number(timezoneOffsetMinutes) : 0;
+    const startMs = Date.UTC(Number(year), Number(month) - 1, Number(day), 0, 0, 0, 0) + safeOffset * 60 * 1000;
+    const start = new Date(startMs);
+    const end = new Date(startMs + 24 * 60 * 60 * 1000);
+    return { start, end, timezoneOffsetMinutes: safeOffset };
+};
+const getCalendarLocalHour = (value, timezoneOffsetMinutes = 0) => {
+    const date = parseBookingDate(value);
+    if (!date)
+        return null;
+    const localDate = new Date(date.getTime() - timezoneOffsetMinutes * 60 * 1000);
+    return localDate.getUTCHours();
+};
+const getCalendarStatusBucket = (status = "") => {
+    if (status === "pending_admin_approval")
+        return "pending";
+    if (["approved_area_assigned", "gate_in_approved"].includes(status))
+        return "approved";
+    if (["stored_in_assigned_area", "gate_out_requested", "gate_out_approved"].includes(status))
+        return "active";
+    if (status === "completed_gate_out_done")
+        return "completed";
+    return "other";
 };
 const validateGateOutDate = (booking, outDate) => {
     const parsedIn = parseBookingDate(booking.inDate || booking.expectedArrivalDate || booking.storageStartDate || booking.storedAt || booking.gateInApprovedAt);
@@ -1086,6 +1115,66 @@ const listAdminBookings = async (req, res) => {
     return res.json({ success: true, bookings: bookings.map(safeBooking) });
 };
 exports.listAdminBookings = listAdminBookings;
+const getAdminBookingCalendar = async (req, res) => {
+    const today = new Date();
+    const fallbackDate = `${today.getUTCFullYear()}-${String(today.getUTCMonth() + 1).padStart(2, "0")}-${String(today.getUTCDate()).padStart(2, "0")}`;
+    const selectedDate = String(req.query.date || fallbackDate);
+    const timezoneOffset = Number(req.query.timezoneOffset || 0);
+    const range = buildCalendarDayRange(selectedDate, timezoneOffset);
+    if (!range)
+        return res.status(400).json({ success: false, message: "Please provide a valid schedule date in YYYY-MM-DD format." });
+    const bookings = await populateBooking(Booking_js_1.default.find({
+        inDate: { $gte: range.start, $lt: range.end },
+        status: { $nin: ["rejected", "cancelled"] },
+    })).sort({ inDate: 1, createdAt: 1, bookingReference: 1 });
+    const safeBookings = bookings.map(safeBooking);
+    const grouped = new Map();
+    const overflow = [];
+    for (const booking of safeBookings) {
+        const hour = getCalendarLocalHour(booking.inDate || booking.expectedArrivalDate, timezoneOffset);
+        if (hour === null)
+            continue;
+        if (!grouped.has(hour))
+            grouped.set(hour, []);
+        const entries = grouped.get(hour);
+        if (entries.length < MAX_CONTAINERS_PER_HOUR) {
+            entries.push(booking);
+        }
+        else {
+            overflow.push(booking);
+        }
+    }
+    const baseHours = Array.from({ length: 10 }, (_, index) => 8 + index);
+    const bookedHours = Array.from(grouped.keys());
+    const allHours = [...baseHours, ...bookedHours];
+    const minHour = allHours.length ? Math.min(...allHours) : 8;
+    const maxHour = allHours.length ? Math.max(...allHours) : 17;
+    const rows = [];
+    for (let hour = minHour; hour <= maxHour; hour += 1) {
+        const rowBookings = grouped.get(hour) || [];
+        rows.push({
+            hour,
+            slots: Array.from({ length: MAX_CONTAINERS_PER_HOUR }, (_, slotIndex) => ({
+                slotNumber: slotIndex + 1,
+                booking: rowBookings[slotIndex] || null,
+            })),
+        });
+    }
+    const summary = { total: safeBookings.length, pending: 0, approved: 0, active: 0, completed: 0, other: 0 };
+    for (const booking of safeBookings) {
+        const bucket = getCalendarStatusBucket(booking.status);
+        summary[bucket] = (summary[bucket] || 0) + 1;
+    }
+    return res.json({
+        success: true,
+        date: selectedDate,
+        maxSlotsPerHour: MAX_CONTAINERS_PER_HOUR,
+        rows,
+        summary,
+        overflowCount: overflow.length,
+    });
+};
+exports.getAdminBookingCalendar = getAdminBookingCalendar;
 const getAdminBooking = async (req, res) => {
     const booking = await populateBooking(Booking_js_1.default.findById(req.params.id));
     if (!booking)
