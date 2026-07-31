@@ -194,6 +194,8 @@ const safeReleaseReport = (report) => {
         clientName: client.companyName || client.name || client.email || "Unknown Client",
         containerNumber: report.containerNumber,
         containerSize: Number(report.containerSize) || 20,
+        containerType: report.containerType || "",
+        containerLoadStatus: report.containerLoadStatus || "empty",
         rateType: normalizeRateType(report.rateType),
         shippingLine: report.shippingLine || "",
         releasedAt: report.releasedAt,
