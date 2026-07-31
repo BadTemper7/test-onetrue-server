@@ -1144,22 +1144,16 @@ const getAdminBookingCalendar = async (req, res) => {
             overflow.push(booking);
         }
     }
-    const baseHours = Array.from({ length: 10 }, (_, index) => 8 + index);
-    const bookedHours = Array.from(grouped.keys());
-    const allHours = [...baseHours, ...bookedHours];
-    const minHour = allHours.length ? Math.min(...allHours) : 8;
-    const maxHour = allHours.length ? Math.max(...allHours) : 17;
-    const rows = [];
-    for (let hour = minHour; hour <= maxHour; hour += 1) {
+    const rows = Array.from({ length: 24 }, (_, hour) => {
         const rowBookings = grouped.get(hour) || [];
-        rows.push({
+        return {
             hour,
             slots: Array.from({ length: MAX_CONTAINERS_PER_HOUR }, (_, slotIndex) => ({
                 slotNumber: slotIndex + 1,
                 booking: rowBookings[slotIndex] || null,
             })),
-        });
-    }
+        };
+    });
     const summary = { total: safeBookings.length, pending: 0, approved: 0, active: 0, completed: 0, other: 0 };
     for (const booking of safeBookings) {
         const bucket = getCalendarStatusBucket(booking.status);
