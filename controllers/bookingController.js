@@ -1062,12 +1062,16 @@ const getClientBooking = async (req, res) => {
 };
 exports.getClientBooking = getClientBooking;
 const listAdminBookings = async (req, res) => {
-    const { status, billingStatus, search } = req.query;
+    const { status, billingStatus, loadStatus, rateType, search } = req.query;
     const query = {};
     if (status && status !== "all")
         query.status = status;
     if (billingStatus && billingStatus !== "all")
         query.billingStatus = billingStatus;
+    if (["empty", "laden"].includes(String(loadStatus || "").toLowerCase()))
+        query.containerLoadStatus = String(loadStatus).toLowerCase();
+    if (["local", "international"].includes(String(rateType || "").toLowerCase()))
+        query.rateType = String(rateType).toLowerCase();
     if (search) {
         const term = String(search).trim();
         query.$or = [

@@ -209,8 +209,14 @@ const safeReleaseReport = (report) => {
 };
 const getYardContainerReport = async (req, res) => {
     const query = { status: { $in: ACTIVE_YARD_STATUSES } };
+    const loadStatus = normalizeKey(req.query.loadStatus);
+    const rateType = normalizeKey(req.query.rateType);
     if (req.query.clientId)
         query.client = req.query.clientId;
+    if (["empty", "laden"].includes(loadStatus))
+        query.containerLoadStatus = loadStatus;
+    if (["local", "international"].includes(rateType))
+        query.rateType = rateType;
     const dateQuery = buildDateQuery(req.query.startDate, req.query.endDate);
     if (dateQuery) {
         query.$or = [
@@ -223,6 +229,10 @@ const getYardContainerReport = async (req, res) => {
     const releaseQuery = {};
     if (req.query.clientId)
         releaseQuery.client = req.query.clientId;
+    if (["empty", "laden"].includes(loadStatus))
+        releaseQuery.containerLoadStatus = loadStatus;
+    if (["local", "international"].includes(rateType))
+        releaseQuery.rateType = rateType;
     if (dateQuery)
         releaseQuery.releasedAt = dateQuery;
     const [bookings, releaseReports, clientUsers] = await Promise.all([
