@@ -1664,6 +1664,44 @@ const recordAdminCashPayment = async (req, res) => {
     if (hasExistingOnlinePayment) {
         return res.status(409).json({ success: false, message: "Cash payment is disabled because an online payment already exists for this booking." });
     }
+    const rawAdditionalItems = Array.isArray(req.body.additionalItems) ? req.body.additionalItems : [];
+    if (rawAdditionalItems.length > 20) {
+        return res.status(400).json({ success: false, message: "A cash payment can include up to 20 additional items." });
+    }
+    const additionalItems = [];
+    for (let index = 0; index < rawAdditionalItems.length; index += 1) {
+        const rawItem = rawAdditionalItems[index] || {};
+        const description = String(rawItem.description || "").trim();
+        const quantity = Number(rawItem.quantity);
+        const rateAmount = Number(rawItem.rateAmount);
+        if (!description) {
+            return res.status(400).json({ success: false, message: `Additional item ${index + 1} requires a description.` });
+        }
+        if (/congestion/i.test(description)) {
+            return res.status(400).json({ success: false, message: "Use the configured Congestion Surcharge option instead of adding it manually." });
+        }
+        if (!Number.isFinite(quantity) || quantity <= 0) {
+            return res.status(400).json({ success: false, message: `Additional item ${index + 1} requires a quantity greater than zero.` });
+        }
+        if (!Number.isFinite(rateAmount) || rateAmount <= 0) {
+            return res.status(400).json({ success: false, message: `Additional item ${index + 1} requires a rate greater than zero.` });
+        }
+        const normalizedQuantity = Math.round(quantity * 100) / 100;
+        const normalizedRateAmount = Math.round(rateAmount * 100) / 100;
+        additionalItems.push({
+            description,
+            quantity: normalizedQuantity,
+            rateAmount: normalizedRateAmount,
+            amount: Math.round(normalizedQuantity * normalizedRateAmount * 100) / 100,
+            notes: String(rawItem.notes || "").trim(),
+            source: "manual",
+            addedBy: req.user._id,
+            addedAt: new Date(),
+        });
+    }
+    if (additionalItems.length > 0) {
+        booking.additionalBillingCharges.push(...additionalItems);
+    }
     booking.isVatApplicable = ![false, "false", "0", 0, "non_vat"].includes(req.body.isVatApplicable);
     const billingResult = await (0, exports.computeBookingBilling)(booking, { persist: true });
     if (!billingResult.hasMatchedRates || billingResult.total <= 0) {
@@ -1709,9 +1747,12 @@ const recordAdminCashPayment = async (req, res) => {
         booking.gateOutApprovedBy = req.user._id;
         booking.gateOutRemarks = String(req.body.gateOutRemarks || "Gate-out automatically approved after cash payment.");
     }
+    const addedItemsHistory = additionalItems.length > 0
+        ? ` Added ${additionalItems.length} additional item${additionalItems.length === 1 ? "" : "s"} worth PHP ${additionalItems.reduce((sum, item) => sum + item.amount, 0).toLocaleString()}.`
+        : "";
     addHistory(booking, {
         billingStatus: "paid_approved",
-        remarks: `Cash payment recorded. Received PHP ${cashReceived.toLocaleString()}, change PHP ${changeAmount.toLocaleString()}. Payment and gate-out approved. Receipt ${booking.receiptNumber}.`,
+        remarks: `Cash payment recorded.${addedItemsHistory} Received PHP ${cashReceived.toLocaleString()}, change PHP ${changeAmount.toLocaleString()}. Payment and gate-out approved. Receipt ${booking.receiptNumber}.`,
         changedBy: req.user._id,
     });
     await booking.save();
@@ -1727,7 +1768,7 @@ const recordAdminCashPayment = async (req, res) => {
         { label: "Payment Reference", value: booking.paymentReferenceNumber },
         { label: "Amount", value: `PHP ${booking.paymentAmount.toLocaleString()}` },
     ]);
-    return res.json({ success: true, message: "Cash payment recorded, receipt generated, and gate-out approved.", booking: payload, receipt: { number: booking.receiptNumber, type: booking.receiptType, cashReceived, changeAmount } });
+    return res.json({ success: true, message: additionalItems.length > 0 ? "Additional items added, cash payment recorded, receipt generated, and gate-out approved." : "Cash payment recorded, receipt generated, and gate-out approved.", booking: payload, receipt: { number: booking.receiptNumber, type: booking.receiptType, cashReceived, changeAmount } });
 };
 exports.recordAdminCashPayment = recordAdminCashPayment;
 const approveBookingPayment = async (req, res) => {
