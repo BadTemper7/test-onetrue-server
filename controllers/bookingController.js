@@ -222,7 +222,7 @@ const validateGateOutDate = (booking, outDate) => {
     const parsedIn = parseBookingDate(booking.inDate || booking.expectedArrivalDate || booking.storageStartDate || booking.storedAt || booking.gateInApprovedAt);
     const parsedOut = parseBookingDate(outDate);
     if (!parsedOut) {
-        return { valid: false, message: "Please select a valid Date Out for the gate-out request." };
+        return { valid: false, message: "Please select a valid Date Out and Time Out for the gate-out request." };
     }
     if (!parsedIn) {
         return { valid: false, message: "Booking has no valid In Date. Please ask admin to review the booking." };

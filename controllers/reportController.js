@@ -14,12 +14,14 @@ const ACTIVE_YARD_STATUSES = [
     "stored_in_assigned_area",
     "gate_out_requested",
     "gate_out_approved",
+    "gate_out_reversal_requested",
 ];
 const CURRENT_INVENTORY_STATUSES = [
     "gate_in_approved",
     "stored_in_assigned_area",
     "gate_out_requested",
     "gate_out_approved",
+    "gate_out_reversal_requested",
 ];
 const MANILA_OFFSET_MS = 8 * 60 * 60 * 1000;
 const emptySizeCounts = () => ({ 20: 0, 40: 0, total: 0 });

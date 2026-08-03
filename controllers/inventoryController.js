@@ -197,6 +197,10 @@ const listInventoryContainers = async (req, res) => {
             .limit(300),
     ]);
     const combined = [...bookingContainers.map(safeBookingContainer), ...containers.map((container) => ({ ...safeContainer(container), source: "pre_advice" }))].sort((a, b) => {
+        const aWaitingStorage = a.source === "booking" && a.bookingStatus === "gate_in_approved" ? 0 : 1;
+        const bWaitingStorage = b.source === "booking" && b.bookingStatus === "gate_in_approved" ? 0 : 1;
+        if (aWaitingStorage !== bWaitingStorage)
+            return aWaitingStorage - bWaitingStorage;
         const bEnteredAt = new Date(b.inventoryEnteredAt || b.gateInApprovedAt || b.storedAt || b.createdAt || 0).getTime();
         const aEnteredAt = new Date(a.inventoryEnteredAt || a.gateInApprovedAt || a.storedAt || a.createdAt || 0).getTime();
         return bEnteredAt - aEnteredAt;
