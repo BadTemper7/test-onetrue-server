@@ -33,7 +33,7 @@ const billingLineItemSchema = new mongoose_1.default.Schema({
 const additionalChargeSchema = new mongoose_1.default.Schema({
     rate: { type: mongoose_1.default.Schema.Types.ObjectId, ref: "BillingRate", default: null },
     chargeCode: { type: String, default: "", trim: true },
-    source: { type: String, enum: ["manual", "congestion_surcharge"], default: "manual" },
+    source: { type: String, enum: ["manual", "congestion_surcharge", "legacy_opening_balance"], default: "manual" },
     description: { type: String, required: true, trim: true },
     quantity: { type: Number, default: 1, min: 0 },
     rateAmount: { type: Number, default: 0, min: 0 },
@@ -82,6 +82,17 @@ const paymentTransactionSchema = new mongoose_1.default.Schema({
 }, { _id: true });
 const bookingSchema = new mongoose_1.default.Schema({
     client: { type: mongoose_1.default.Schema.Types.ObjectId, ref: "User", required: true, index: true },
+    recordSource: { type: String, enum: ["client_booking", "admin_manual", "legacy_migration"], default: "client_booking", index: true },
+    legacyRegistrationNumber: { type: String, default: "", trim: true, index: true },
+    legacyRegisteredAt: { type: Date, default: null },
+    legacyRegisteredBy: { type: mongoose_1.default.Schema.Types.ObjectId, ref: "User", default: null },
+    legacyRegistrationReason: { type: String, default: "", trim: true },
+    historicalGateInDateType: { type: String, enum: ["exact", "estimated", "unknown"], default: "unknown" },
+    historicalSourceReference: { type: String, default: "", trim: true },
+    billingStartMethod: { type: String, enum: ["historical_gate_in", "migration_date"], default: "migration_date" },
+    migrationDate: { type: Date, default: null },
+    openingBalanceAmount: { type: Number, default: 0, min: 0 },
+    openingCreditAmount: { type: Number, default: 0, min: 0 },
     bookingReference: { type: String, required: true, unique: true, index: true },
     containerNumber: { type: String, required: true, uppercase: true, trim: true, index: true },
     containerSize: { type: Number, enum: [20, 40], required: true },
@@ -245,6 +256,8 @@ bookingSchema.pre("validate", function () {
     this.approvedPaymentAmount = Math.max(Number(this.approvedPaymentAmount) || 0, 0);
     this.paymentCreditAmount = Math.max(Number(this.paymentCreditAmount) || 0, 0);
     this.paymentBalanceDue = Math.max(Number(this.paymentBalanceDue) || 0, 0);
+    this.openingBalanceAmount = Math.max(Number(this.openingBalanceAmount) || 0, 0);
+    this.openingCreditAmount = Math.max(Number(this.openingCreditAmount) || 0, 0);
     this.gateOutReversalCount = Math.max(Number(this.gateOutReversalCount) || 0, 0);
     this.cashReceived = Math.max(Number(this.cashReceived) || 0, 0);
     this.changeAmount = Math.max(Number(this.changeAmount) || 0, 0);

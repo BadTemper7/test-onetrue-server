@@ -294,6 +294,11 @@ const shouldApplyBillingRate = (rate, booking) => {
     if (scope === "display_only")
         return false;
     if (scope === "optional_stripping_stuffing") return false;
+    if (booking.recordSource === "legacy_migration" && booking.billingStartMethod === "migration_date") {
+        const unit = String(rate.unit || "").toLowerCase();
+        const isStorageRate = ["storage_day", "per_day"].includes(unit) || /storage/.test(rateText);
+        if (!isStorageRate) return false;
+    }
     return true;
 };
 const roundMoney = (value) => Math.round((Number(value) || 0) * 100) / 100;
@@ -522,7 +527,8 @@ const populateBooking = (query) => {
         .populate("approvedBy", "name")
         .populate("gateInApprovedBy", "name")
         .populate("gateOutApprovedBy", "name")
-        .populate("releasedBy", "name");
+        .populate("releasedBy", "name")
+        .populate("legacyRegisteredBy", "name");
 };
 const safeBooking = (booking) => {
     const doc = booking.toObject ? booking.toObject() : booking;
@@ -533,9 +539,21 @@ const safeBooking = (booking) => {
     const gateInApprovedBy = doc.gateInApprovedBy || null;
     const gateOutApprovedBy = doc.gateOutApprovedBy || null;
     const releasedBy = doc.releasedBy || null;
+    const legacyRegisteredBy = doc.legacyRegisteredBy || null;
     return {
         id: String(doc._id),
         client: client?._id ? String(client._id) : String(doc.client),
+        recordSource: doc.recordSource || "client_booking",
+        legacyRegistrationNumber: doc.legacyRegistrationNumber || "",
+        legacyRegisteredAt: doc.legacyRegisteredAt,
+        legacyRegisteredByName: legacyRegisteredBy?.name || "",
+        legacyRegistrationReason: doc.legacyRegistrationReason || "",
+        historicalGateInDateType: doc.historicalGateInDateType || "unknown",
+        historicalSourceReference: doc.historicalSourceReference || "",
+        billingStartMethod: doc.billingStartMethod || "migration_date",
+        migrationDate: doc.migrationDate,
+        openingBalanceAmount: Number(doc.openingBalanceAmount) || 0,
+        openingCreditAmount: Number(doc.openingCreditAmount) || 0,
         clientName: getClientDisplayName(client),
         clientEmail: client.email || "",
         clientPhoneNumber: client.phoneNumber || "",
@@ -1286,7 +1304,7 @@ const getClientBooking = async (req, res) => {
 };
 exports.getClientBooking = getClientBooking;
 const listAdminBookings = async (req, res) => {
-    const { status, billingStatus, loadStatus, rateType, search } = req.query;
+    const { status, billingStatus, loadStatus, rateType, recordSource, search } = req.query;
     const query = {};
     if (status && status !== "all")
         query.status = status;
@@ -1296,11 +1314,22 @@ const listAdminBookings = async (req, res) => {
         query.containerLoadStatus = String(loadStatus).toLowerCase();
     if (["local", "international"].includes(String(rateType || "").toLowerCase()))
         query.rateType = String(rateType).toLowerCase();
+    const normalizedRecordSource = String(recordSource || "").toLowerCase();
+    if (normalizedRecordSource === "client_booking") {
+        query.$and = [
+            ...(query.$and || []),
+            { $or: [{ recordSource: "client_booking" }, { recordSource: { $exists: false } }, { recordSource: "" }] },
+        ];
+    }
+    else if (["admin_manual", "legacy_migration"].includes(normalizedRecordSource)) {
+        query.recordSource = normalizedRecordSource;
+    }
     if (search) {
         const term = String(search).trim();
         query.$or = [
             { bookingReference: { $regex: term, $options: "i" } },
             { bookingNumber: { $regex: term, $options: "i" } },
+            { legacyRegistrationNumber: { $regex: term, $options: "i" } },
             { containerNumber: { $regex: term, $options: "i" } },
             { shippingLine: { $regex: term, $options: "i" } },
         ];
@@ -1321,6 +1350,7 @@ const getAdminBookingCalendar = async (req, res) => {
     const bookings = await populateBooking(Booking_js_1.default.find({
         inDate: { $gte: range.start, $lt: range.end },
         status: { $nin: ["rejected", "cancelled"] },
+        recordSource: { $ne: "legacy_migration" },
     })).sort({ inDate: 1, createdAt: 1, bookingReference: 1 });
     const safeBookings = bookings.map(safeBooking);
     const grouped = new Map();
@@ -2574,6 +2604,7 @@ const completeBookingGateOut = async (req, res) => {
             client: booking.client,
             bookingReference: booking.bookingReference,
             bookingNumber: booking.bookingNumber || "",
+            recordSource: booking.recordSource || "client_booking",
             containerNumber: booking.containerNumber,
             containerSize: booking.containerSize,
             containerType: booking.containerType || "",

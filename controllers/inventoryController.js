@@ -3,17 +3,45 @@ var __importDefault = (this && this.__importDefault) || function (mod) {
     return (mod && mod.__esModule) ? mod : { "default": mod };
 };
 Object.defineProperty(exports, "__esModule", { value: true });
-exports.assignInventoryContainer = exports.listInventoryContainers = void 0;
+exports.assignInventoryContainer = exports.createLegacyInventoryContainer = exports.listInventoryClients = exports.listInventoryContainers = void 0;
 const InventoryContainer_js_1 = __importDefault(require("../models/InventoryContainer.js"));
 const Booking_js_1 = __importDefault(require("../models/Booking.js"));
+const User_js_1 = __importDefault(require("../models/User.js"));
 const YardArea_js_1 = __importDefault(require("../models/YardArea.js"));
 const YardBlock_js_1 = __importDefault(require("../models/YardBlock.js"));
 const socket_js_1 = require("../socket/socket.js");
+const bookingController_js_1 = require("./bookingController.js");
+const bookingNumber_js_1 = require("../utils/bookingNumber.js");
+const localFileStorage_js_1 = require("../utils/localFileStorage.js");
+const notificationService_js_1 = require("../utils/notificationService.js");
 const toNumber = (value, fallback = 0) => {
     const parsed = Number(value);
     return Number.isFinite(parsed) ? parsed : fallback;
 };
 const normalizeRateType = (value) => String(value || "").toLowerCase() === "international" ? "international" : "local";
+const normalizeContainerNumber = (value = "") => String(value).toUpperCase().replace(/[^A-Z0-9]/g, "").trim();
+const parseJsonArray = (value) => {
+    if (Array.isArray(value)) return value;
+    if (!value) return [];
+    try {
+        const parsed = JSON.parse(value);
+        return Array.isArray(parsed) ? parsed : [];
+    }
+    catch {
+        return String(value).split(",").map((item) => item.trim()).filter(Boolean);
+    }
+};
+const buildLegacyReference = async () => {
+    const now = new Date();
+    const dateCode = `${now.getFullYear()}${String(now.getMonth() + 1).padStart(2, "0")}${String(now.getDate()).padStart(2, "0")}`;
+    const prefix = `LEG-${dateCode}-`;
+    let sequence = await Booking_js_1.default.countDocuments({ legacyRegistrationNumber: { $regex: `^${prefix}` } }) + 1;
+    while (true) {
+        const value = `${prefix}${String(sequence).padStart(5, "0")}`;
+        if (!(await Booking_js_1.default.exists({ $or: [{ legacyRegistrationNumber: value }, { bookingReference: value }] }))) return value;
+        sequence += 1;
+    }
+};
 const getYardCapacityUsage = (containerSize, yardContainerSize = 20) => {
     const size = Number(containerSize) || 20;
     const yardSize = Number(yardContainerSize) || 20;
@@ -56,9 +84,21 @@ const safeBookingContainer = (booking) => {
     const client = doc.client || {};
     const area = doc.assignedArea || null;
     const block = doc.assignedBlock || null;
+    const legacyRegisteredBy = doc.legacyRegisteredBy || null;
     return {
         id: String(doc._id),
         source: "booking",
+        recordSource: doc.recordSource || "client_booking",
+        legacyRegistrationNumber: doc.legacyRegistrationNumber || "",
+        legacyRegisteredAt: doc.legacyRegisteredAt,
+        legacyRegisteredByName: legacyRegisteredBy?.name || "",
+        legacyRegistrationReason: doc.legacyRegistrationReason || "",
+        historicalGateInDateType: doc.historicalGateInDateType || "unknown",
+        historicalSourceReference: doc.historicalSourceReference || "",
+        billingStartMethod: doc.billingStartMethod || "migration_date",
+        migrationDate: doc.migrationDate,
+        openingBalanceAmount: Number(doc.openingBalanceAmount) || 0,
+        openingCreditAmount: Number(doc.openingCreditAmount) || 0,
         bookingReference: doc.bookingReference,
         preAdvice: "",
         gateIn: "",
@@ -102,6 +142,17 @@ const safeBookingContainer = (booking) => {
         truckPlateNumber: doc.truckPlateNumber || "",
         driverName: doc.driverName || "",
         damageRemarks: doc.inspectionRemarks || "",
+        documents: doc.documents || [],
+        sealNumber: doc.sealNumber || "",
+        sealIntact: doc.sealIntact || "",
+        driverLicenseNumber: doc.driverLicenseNumber || "",
+        hauler: doc.hauler || "",
+        gateInConditions: doc.gateInConditions || [],
+        gateInConditionOther: doc.gateInConditionOther || "",
+        billingSubtotal: Number(doc.billingSubtotal) || 0,
+        vatAmount: Number(doc.vatAmount) || 0,
+        billingTotal: Number(doc.billingTotal) || 0,
+        paymentBalanceDue: Number(doc.paymentBalanceDue ?? doc.paymentAmount) || 0,
         assignedAt: doc.assignedAt,
         createdAt: doc.createdAt,
         updatedAt: doc.updatedAt,
@@ -157,6 +208,301 @@ const safeContainer = (container) => {
         updatedAt: doc.updatedAt,
     };
 };
+const listInventoryClients = async (req, res) => {
+    const clients = await User_js_1.default.find({
+        userType: "client",
+        status: { $in: ["verified", "active"] },
+    }).select("name companyName email phoneNumber status").sort({ companyName: 1, name: 1 }).limit(500);
+    return res.json({
+        success: true,
+        clients: clients.map((client) => ({
+            id: String(client._id),
+            name: client.companyName || client.name || client.email,
+            contactName: client.name || "",
+            email: client.email || "",
+            phoneNumber: client.phoneNumber || "",
+            status: client.status,
+        })),
+    });
+};
+exports.listInventoryClients = listInventoryClients;
+const createLegacyInventoryContainer = async (req, res) => {
+    const {
+        clientId,
+        containerNumber,
+        containerSize,
+        containerType,
+        containerLoadStatus,
+        rateType,
+        shippingLine,
+        sealNumber,
+        sealIntact,
+        truckPlateNumber,
+        driverName,
+        driverLicenseNumber,
+        hauler,
+        historicalGateInDate,
+        historicalGateInDateType,
+        historicalSourceReference,
+        areaId,
+        blockId,
+        bay,
+        row,
+        tier,
+        billingStartMethod,
+        isVatApplicable,
+        openingBalanceAmount,
+        openingCreditAmount,
+        legacyRegistrationReason,
+        inspectionRemarks,
+        gateInConditionOther,
+    } = req.body;
+    const required = [clientId, containerNumber, containerSize, containerType, containerLoadStatus, rateType, shippingLine, areaId, blockId, legacyRegistrationReason];
+    if (required.some((value) => !String(value || "").trim())) {
+        return res.status(400).json({ success: false, message: "Complete all required existing-container fields." });
+    }
+    if (![20, 40].includes(Number(containerSize))) {
+        return res.status(400).json({ success: false, message: "Container size must be 20ft or 40ft." });
+    }
+    if (!["empty", "laden"].includes(String(containerLoadStatus).toLowerCase())) {
+        return res.status(400).json({ success: false, message: "Select whether the container is Empty or Laden." });
+    }
+    if (!["local", "international"].includes(String(rateType).toLowerCase())) {
+        return res.status(400).json({ success: false, message: "Select Local or International rate classification." });
+    }
+    const client = await User_js_1.default.findOne({ _id: clientId, userType: "client", status: { $in: ["verified", "active"] } });
+    if (!client) {
+        return res.status(404).json({ success: false, message: "Verified client account not found." });
+    }
+    const normalizedContainer = normalizeContainerNumber(containerNumber);
+    if (!normalizedContainer) {
+        return res.status(400).json({ success: false, message: "Enter a valid container number." });
+    }
+    const [activeBooking, activeInventory] = await Promise.all([
+        Booking_js_1.default.findOne({ containerNumber: normalizedContainer, status: { $nin: ["rejected", "cancelled", "completed_gate_out_done"] } }),
+        InventoryContainer_js_1.default.findOne({ containerNumber: normalizedContainer, status: { $ne: "released" } }),
+    ]);
+    if (activeBooking || activeInventory) {
+        return res.status(409).json({ success: false, message: "This container number already has an active record." });
+    }
+    const [area, block] = await Promise.all([
+        YardArea_js_1.default.findById(areaId),
+        YardBlock_js_1.default.findById(blockId),
+    ]);
+    if (!area || !block || String(block.area) !== String(area._id)) {
+        return res.status(404).json({ success: false, message: "The selected yard area or block is invalid." });
+    }
+    if (!['active', 'full'].includes(block.status)) {
+        return res.status(400).json({ success: false, message: "Existing containers can only be registered in active yard blocks." });
+    }
+    const nextBay = Math.max(toNumber(bay, 1), 1);
+    const nextRow = Math.max(toNumber(row, 1), 1);
+    const nextTier = Math.max(toNumber(tier, 1), 1);
+    if (nextBay > block.bayCount || nextRow > block.rowCount || nextTier > block.tierCount) {
+        return res.status(400).json({ success: false, message: `Location exceeds block limits: Bay ${block.bayCount}, Row ${block.rowCount}, Tier ${block.tierCount}.` });
+    }
+    const requestedSlotKeys = getReservedSlotKeys({ bay: nextBay, row: nextRow, tier: nextTier, containerSize: Number(containerSize), yardContainerSize: block.containerSize });
+    if (requestedSlotKeys.length === 2 && nextBay + 1 > Number(block.bayCount || 1)) {
+        return res.status(400).json({ success: false, message: "A 40ft container needs two adjacent 20ft TEU slots." });
+    }
+    const [otherInventory, activeBookings] = await Promise.all([
+        InventoryContainer_js_1.default.find({ block: block._id, status: { $ne: "released" } }).select("containerSize bay row tier"),
+        Booking_js_1.default.find({
+            assignedBlock: block._id,
+            status: { $in: ["approved_area_assigned", "gate_in_approved", "stored_in_assigned_area", "gate_out_requested", "gate_out_approved", "gate_out_reversal_requested"] },
+        }).select("containerSize assignedBay assignedRow assignedTier"),
+    ]);
+    const occupiedKeys = new Set([
+        ...otherInventory.flatMap((item) => getReservedSlotKeys({ bay: item.bay, row: item.row, tier: item.tier, containerSize: item.containerSize, yardContainerSize: block.containerSize })),
+        ...activeBookings.flatMap((item) => getReservedSlotKeys({ bay: item.assignedBay, row: item.assignedRow, tier: item.assignedTier, containerSize: item.containerSize, yardContainerSize: block.containerSize })),
+    ]);
+    if (requestedSlotKeys.some((key) => occupiedKeys.has(key))) {
+        return res.status(409).json({ success: false, message: "One or both required yard slots are already occupied or reserved." });
+    }
+    const usedCapacity = [...otherInventory, ...activeBookings].reduce((total, item) => total + getYardCapacityUsage(item.containerSize, block.containerSize), 0);
+    if (usedCapacity + getYardCapacityUsage(Number(containerSize), block.containerSize) > Number(block.teuSlots)) {
+        return res.status(400).json({ success: false, message: "The selected block does not have enough available capacity." });
+    }
+    const migrationDate = new Date();
+    const dateType = ["exact", "estimated", "unknown"].includes(String(historicalGateInDateType)) ? String(historicalGateInDateType) : "unknown";
+    let historicalDate = migrationDate;
+    if (dateType !== "unknown") {
+        historicalDate = new Date(historicalGateInDate);
+        if (Number.isNaN(historicalDate.getTime())) {
+            return res.status(400).json({ success: false, message: "Provide a valid historical Gate-In date." });
+        }
+        if (historicalDate > migrationDate) {
+            return res.status(400).json({ success: false, message: "Historical Gate-In date cannot be in the future." });
+        }
+    }
+    const startMethod = billingStartMethod === "historical_gate_in" ? "historical_gate_in" : "migration_date";
+    const storageStartDate = startMethod === "historical_gate_in" ? historicalDate : migrationDate;
+    const legacyRegistrationNumber = await buildLegacyReference();
+    const bookingNumber = await (0, bookingNumber_js_1.buildBookingNumber)();
+    const documents = [];
+    if (req.file) {
+        const stored = await (0, localFileStorage_js_1.saveUploadedFile)({
+            file: req.file,
+            clientId: client._id,
+            clientName: client.companyName || client.name,
+            category: "legacy-container",
+            prefix: legacyRegistrationNumber,
+        });
+        documents.push({
+            type: "legacySupportingDocument",
+            label: "Legacy Container Supporting Document",
+            fileName: req.file.originalname,
+            url: stored.url,
+            secureUrl: stored.secureUrl,
+            publicId: stored.publicId,
+            resourceType: stored.resourceType,
+            mimeType: req.file.mimetype,
+            sizeBytes: stored.sizeBytes,
+            uploadedAt: migrationDate,
+        });
+    }
+    const conditions = parseJsonArray(req.body.gateInConditions).map((item) => String(item).trim().toUpperCase()).filter(Boolean);
+    const openingBalance = Math.max(Number(openingBalanceAmount) || 0, 0);
+    const openingCredit = Math.max(Number(openingCreditAmount) || 0, 0);
+    const additionalBillingCharges = openingBalance > 0 ? [{
+        rate: null,
+        chargeCode: "LEGACY_OPENING_BALANCE",
+        source: "legacy_opening_balance",
+        description: "Opening balance from records before system migration",
+        quantity: 1,
+        rateAmount: openingBalance,
+        amount: openingBalance,
+        notes: historicalSourceReference || legacyRegistrationReason,
+        addedBy: req.user._id,
+        addedAt: migrationDate,
+    }] : [];
+    const paymentTransactions = openingCredit > 0 ? [{
+        amount: openingCredit,
+        subtotal: openingCredit,
+        isVatApplicable: false,
+        vatRate: 0,
+        vatAmount: 0,
+        grossTotal: openingCredit,
+        lineItems: [],
+        paymentTypeSnapshot: { type: "legacy", name: "Opening Credit" },
+        referenceNumber: historicalSourceReference || legacyRegistrationNumber,
+        paymentDate: migrationDate,
+        remarks: "Opening credit carried forward during legacy container registration.",
+        proofs: documents,
+        submittedAt: migrationDate,
+        approvedAt: migrationDate,
+        approvedBy: req.user._id,
+        receiptNumber: "",
+        receiptType: "acknowledgement_receipt",
+        cashReceived: 0,
+        changeAmount: 0,
+        source: "legacy",
+        archivedAt: migrationDate,
+    }] : [];
+    const booking = await Booking_js_1.default.create({
+        client: client._id,
+        recordSource: "legacy_migration",
+        legacyRegistrationNumber,
+        legacyRegisteredAt: migrationDate,
+        legacyRegisteredBy: req.user._id,
+        legacyRegistrationReason: String(legacyRegistrationReason).trim(),
+        historicalGateInDateType: dateType,
+        historicalSourceReference: String(historicalSourceReference || "").trim(),
+        billingStartMethod: startMethod,
+        migrationDate,
+        openingBalanceAmount: openingBalance,
+        openingCreditAmount: openingCredit,
+        bookingReference: legacyRegistrationNumber,
+        bookingNumber,
+        qrCodeValue: `OTLI:LEGACY:${bookingNumber}:${normalizedContainer}`,
+        containerNumber: normalizedContainer,
+        actualContainerNumber: normalizedContainer,
+        containerSize: Number(containerSize),
+        containerType,
+        containerLoadStatus: String(containerLoadStatus).toLowerCase(),
+        rateType: normalizeRateType(rateType),
+        serviceType: "container_yard",
+        shippingLine: String(shippingLine).trim(),
+        expectedArrivalDate: historicalDate,
+        inDate: historicalDate,
+        documents,
+        status: "stored_in_assigned_area",
+        billingStatus: "unpaid",
+        isVatApplicable: String(isVatApplicable || "true").toLowerCase() !== "false",
+        submittedAt: migrationDate,
+        approvedAt: migrationDate,
+        approvedBy: req.user._id,
+        assignedArea: area._id,
+        assignedBlock: block._id,
+        assignedBay: nextBay,
+        assignedRow: nextRow,
+        assignedTier: nextTier,
+        assignedSlotNumber: `${block.code}-B${nextBay}-R${nextRow}-T${nextTier}`,
+        assignedAt: migrationDate,
+        assignedBy: req.user._id,
+        gateInApprovedAt: historicalDate,
+        gateInApprovedBy: req.user._id,
+        gateInPassNumber: "",
+        gateInConditions: conditions.length ? conditions : ["GOOD"],
+        gateInConditionOther: String(gateInConditionOther || "").trim(),
+        physicalCondition: conditions.length ? conditions.join(", ") : "GOOD",
+        sealNumber: String(sealNumber || "").trim(),
+        sealIntact: ["yes", "no"].includes(String(sealIntact || "").toLowerCase()) ? String(sealIntact).toLowerCase() : "",
+        truckPlateNumber: String(truckPlateNumber || "").trim(),
+        driverName: String(driverName || "").trim(),
+        driverLicenseNumber: String(driverLicenseNumber || "").trim(),
+        hauler: String(hauler || "").trim(),
+        inspectionRemarks: String(inspectionRemarks || "").trim(),
+        storedAt: migrationDate,
+        storedBy: req.user._id,
+        storageStartDate,
+        additionalBillingCharges,
+        approvedPaymentAmount: openingCredit,
+        paymentTransactions,
+        statusHistory: [{
+            status: "stored_in_assigned_area",
+            billingStatus: "unpaid",
+            remarks: `Existing container registered as a legacy migration record. Historical Gate-In date quality: ${dateType}. Billing begins from ${startMethod === "historical_gate_in" ? "the historical Gate-In date" : "the migration date"}.`,
+            changedBy: req.user._id,
+            changedAt: migrationDate,
+        }],
+    });
+    const billingResult = await (0, bookingController_js_1.computeBookingBilling)(booking, { asOf: migrationDate, persist: true });
+    if (openingCredit > 0 && Number(booking.paymentBalanceDue || 0) <= 0) booking.billingStatus = "paid_approved";
+    booking.statusHistory.push({
+        status: booking.status,
+        billingStatus: booking.billingStatus,
+        remarks: `Legacy registration billing initialized at PHP ${Number(billingResult.total || 0).toLocaleString()} with PHP ${openingCredit.toLocaleString()} opening credit and PHP ${Number(booking.paymentBalanceDue || 0).toLocaleString()} balance due.`,
+        changedBy: req.user._id,
+        changedAt: new Date(),
+    });
+    await booking.save();
+    await recalculateBlockOccupancy(block._id);
+    await booking.populate("client", "name email companyName phoneNumber");
+    await booking.populate("assignedArea", "name code isCongestionArea");
+    await booking.populate("assignedBlock", "name code");
+    await booking.populate("legacyRegisteredBy", "name");
+    (0, socket_js_1.emitToAdmins)("inventory:legacy_container_created", { id: String(booking._id), bookingReference: booking.bookingReference, containerNumber: booking.containerNumber });
+    (0, socket_js_1.emitToAdmins)("storage:updated", { id: String(booking._id), containerNumber: booking.containerNumber });
+    (0, socket_js_1.emitToAdmins)("yard:slot_reserved", { id: String(booking._id), containerNumber: booking.containerNumber, blockId: String(block._id) });
+    (0, socket_js_1.emitToUser)(client._id, "booking:legacy_registered", { id: String(booking._id), bookingReference: booking.bookingReference, containerNumber: booking.containerNumber });
+    await (0, notificationService_js_1.createClientNotification)({
+        recipient: client._id,
+        type: "booking",
+        title: "Existing container added to inventory",
+        message: `Container ${booking.containerNumber} was registered in the OTLI inventory from historical company records.`,
+        booking: booking._id,
+        bookingReference: booking.bookingReference,
+        containerNumber: booking.containerNumber,
+        actionPath: "/booking-history",
+    });
+    return res.status(201).json({
+        success: true,
+        message: `Existing container registered as ${legacyRegistrationNumber}. Billing computed at PHP ${Number(billingResult.total || 0).toLocaleString()}.`,
+        booking: { id: String(booking._id), bookingReference: booking.bookingReference, containerNumber: booking.containerNumber },
+    });
+};
+exports.createLegacyInventoryContainer = createLegacyInventoryContainer;
 const listInventoryContainers = async (req, res) => {
     const { areaId, status, search } = req.query;
     const query = {};
@@ -193,6 +539,7 @@ const listInventoryContainers = async (req, res) => {
             .populate("client", "name email companyName")
             .populate("assignedArea", "name code")
             .populate("assignedBlock", "name code")
+            .populate("legacyRegisteredBy", "name")
             .sort({ gateInApprovedAt: -1, storedAt: -1, updatedAt: -1 })
             .limit(300),
     ]);
