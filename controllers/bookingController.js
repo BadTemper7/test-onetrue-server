@@ -29,6 +29,14 @@ const ACTIVE_BOOKING_STATUSES = [
 ];
 const TERMINAL_BOOKING_STATUSES = ["rejected", "cancelled", "completed_gate_out_done"];
 const normalizeContainerNumber = (value = "") => String(value).toUpperCase().replace(/[^A-Z0-9]/g, "").trim();
+const buildGatePassNumber = (prefix, bookingReference, bookingId = "") => {
+    const reference = String(bookingReference || bookingId || Date.now())
+        .toUpperCase()
+        .replace(/^BK-?/, "")
+        .replace(/[^A-Z0-9-]/g, "")
+        .replace(/^-+|-+$/g, "");
+    return `${prefix}-${reference || Date.now()}`;
+};
 const toNumber = (value, fallback = 0) => {
     const parsed = Number(value);
     return Number.isFinite(parsed) ? parsed : fallback;
@@ -568,6 +576,7 @@ const safeBooking = (booking) => {
         approvedByName: approvedBy?.name || "",
         gateInApprovedAt: doc.gateInApprovedAt,
         gateInApprovedByName: gateInApprovedBy?.name || "",
+        gateInPassNumber: doc.gateInPassNumber || (doc.gateInApprovedAt ? buildGatePassNumber("GIN", doc.bookingReference, doc._id) : ""),
         actualContainerNumber: doc.actualContainerNumber || "",
         physicalCondition: doc.physicalCondition || "",
         gateInConditions: doc.gateInConditions || [],
@@ -649,6 +658,7 @@ const safeBooking = (booking) => {
         gateOutRejectionReason: doc.gateOutRejectionReason || "",
         gateOutApprovedAt: doc.gateOutApprovedAt,
         gateOutApprovedByName: gateOutApprovedBy?.name || "",
+        gateOutPassNumber: doc.gateOutPassNumber || (doc.gateOutApprovedAt ? buildGatePassNumber("GOUT", doc.bookingReference, doc._id) : ""),
         gateOutRemarks: doc.gateOutRemarks || "",
         gateOutReversalRequestedAt: doc.gateOutReversalRequestedAt,
         gateOutReversalRequestReason: doc.gateOutReversalRequestReason || "",
@@ -1573,6 +1583,7 @@ const approveBookingGateIn = async (req, res) => {
     booking.status = "gate_in_approved";
     booking.gateInApprovedAt = receivedAt;
     booking.gateInApprovedBy = req.user._id;
+    booking.gateInPassNumber = booking.gateInPassNumber || buildGatePassNumber("GIN", booking.bookingReference, booking._id);
     booking.actualContainerNumber = actualContainerNumber;
     booking.gateInConditions = gateInConditions.length ? gateInConditions : ["GOOD"];
     booking.gateInConditionOther = gateInConditionOther;
@@ -1585,7 +1596,7 @@ const approveBookingGateIn = async (req, res) => {
     booking.hauler = booking.hauler || req.body.hauler || "";
     booking.inspectionRemarks = req.body.inspectionRemarks || "";
     addHistory(booking, {
-        remarks: "Gate-In approved. Container added to Inventory and is awaiting storage confirmation.",
+        remarks: `Gate-In approved under pass ${booking.gateInPassNumber}. Container added to Inventory and is awaiting storage confirmation.`,
         changedBy: req.user._id,
     });
     await booking.save();
@@ -1599,6 +1610,7 @@ const approveBookingGateIn = async (req, res) => {
     (0, socket_js_1.emitToAdmins)("inventory:updated", payload);
     (0, socket_js_1.emitToUser)(booking.client?._id || booking.client, "booking:gate_in_approved", payload);
     await notifyClient(booking, "Gate-In approved", "Your container passed Gate-In inspection and is now listed in Inventory for storage confirmation.", [
+        { label: "Gate-In Pass No.", value: booking.gateInPassNumber },
         { label: "Container", value: booking.containerNumber },
         { label: "Truck Plate", value: booking.truckPlateNumber },
         { label: "Assigned Slot", value: booking.assignedSlotNumber },
@@ -2339,8 +2351,9 @@ const approveBookingGateOut = async (req, res) => {
     booking.gateOutRejectionReason = "";
     booking.gateOutApprovedAt = new Date();
     booking.gateOutApprovedBy = req.user._id;
+    booking.gateOutPassNumber = booking.gateOutPassNumber || buildGatePassNumber("GOUT", booking.bookingReference, booking._id);
     booking.gateOutRemarks = req.body.remarks || "";
-    addHistory(booking, { remarks: "Gate-out approved by admin.", changedBy: req.user._id });
+    addHistory(booking, { remarks: `Gate-out approved by admin under pass ${booking.gateOutPassNumber}.`, changedBy: req.user._id });
     await booking.save();
     await booking.populate("client", "name email companyName phoneNumber");
     await booking.populate("assignedArea", "name code isCongestionArea");
@@ -2350,6 +2363,7 @@ const approveBookingGateOut = async (req, res) => {
     (0, socket_js_1.emitToAdmins)("booking:gate_out_approved", payload);
     (0, socket_js_1.emitToUser)(booking.client?._id || booking.client, "booking:gate_out_approved", payload);
     await notifyClient(booking, "Gate-out approved", "Your container is approved for release from the yard.", [
+        { label: "Gate-Out Pass No.", value: booking.gateOutPassNumber },
         { label: "Container", value: booking.containerNumber },
         { label: "Assigned Slot", value: booking.assignedSlotNumber },
     ]);
