@@ -125,6 +125,27 @@ const buildPaymentReferenceNumber = async () => {
 const normalizeBillingRateKey = (value) => String(value || "all").trim().toLowerCase();
 const normalizeBookingServiceType = () => "container_yard";
 const normalizeRateType = (value) => String(value || "").toLowerCase() === "international" ? "international" : "local";
+const CONDITION_OPTIONS = ["GOOD", "DENTED", "RUST", "HOLE", "DOOR DAMAGE", "OTHER"];
+const normalizeConditionSelections = (values = []) => {
+    const next = Array.isArray(values) ? values : values ? [values] : [];
+    return Array.from(new Set(next.map((value) => String(value || "").trim().toUpperCase()).filter((value) => CONDITION_OPTIONS.includes(value))));
+};
+const buildConditionSummary = (conditions = [], other = "") => {
+    const normalized = normalizeConditionSelections(conditions);
+    const labels = normalized.filter((value) => value !== "OTHER");
+    const otherText = String(other || "").trim();
+    if (normalized.includes("OTHER") && otherText) {
+        labels.push(`OTHER: ${otherText}`);
+    }
+    else if (normalized.includes("OTHER")) {
+        labels.push("OTHER");
+    }
+    return labels.join(", ") || "GOOD";
+};
+const normalizeYesNo = (value = "") => {
+    const normalized = String(value || "").trim().toLowerCase();
+    return ["yes", "no"].includes(normalized) ? normalized : "";
+};
 const parseBookingDate = (value) => {
     if (!value)
         return null;
@@ -489,13 +510,21 @@ const populateBooking = (query) => {
     return query
         .populate("client", "name email companyName phoneNumber")
         .populate("assignedArea", "name code isCongestionArea")
-        .populate("assignedBlock", "name code teuSlots occupiedSlots bayCount rowCount tierCount containerSize");
+        .populate("assignedBlock", "name code teuSlots occupiedSlots bayCount rowCount tierCount containerSize")
+        .populate("approvedBy", "name")
+        .populate("gateInApprovedBy", "name")
+        .populate("gateOutApprovedBy", "name")
+        .populate("releasedBy", "name");
 };
 const safeBooking = (booking) => {
     const doc = booking.toObject ? booking.toObject() : booking;
     const client = doc.client || {};
     const area = doc.assignedArea || null;
     const block = doc.assignedBlock || null;
+    const approvedBy = doc.approvedBy || null;
+    const gateInApprovedBy = doc.gateInApprovedBy || null;
+    const gateOutApprovedBy = doc.gateOutApprovedBy || null;
+    const releasedBy = doc.releasedBy || null;
     return {
         id: String(doc._id),
         client: client?._id ? String(client._id) : String(doc.client),
@@ -536,13 +565,21 @@ const safeBooking = (booking) => {
         assignedTier: Number(doc.assignedTier) || 1,
         assignedSlotNumber: doc.assignedSlotNumber || "",
         approvedAt: doc.approvedAt,
+        approvedByName: approvedBy?.name || "",
         gateInApprovedAt: doc.gateInApprovedAt,
+        gateInApprovedByName: gateInApprovedBy?.name || "",
         actualContainerNumber: doc.actualContainerNumber || "",
         physicalCondition: doc.physicalCondition || "",
+        gateInConditions: doc.gateInConditions || [],
+        gateInConditionOther: doc.gateInConditionOther || "",
+        gateOutConditions: doc.gateOutConditions || [],
+        gateOutConditionOther: doc.gateOutConditionOther || "",
         sealNumber: doc.sealNumber || "",
+        sealIntact: doc.sealIntact || "",
         truckPlateNumber: doc.truckPlateNumber || "",
         driverName: doc.driverName || "",
         driverLicenseNumber: doc.driverLicenseNumber || "",
+        hauler: doc.hauler || "",
         inspectionRemarks: doc.inspectionRemarks || "",
         storedAt: doc.storedAt,
         storageStartDate: doc.storageStartDate,
@@ -611,6 +648,7 @@ const safeBooking = (booking) => {
         gateOutRejectedAt: doc.gateOutRejectedAt,
         gateOutRejectionReason: doc.gateOutRejectionReason || "",
         gateOutApprovedAt: doc.gateOutApprovedAt,
+        gateOutApprovedByName: gateOutApprovedBy?.name || "",
         gateOutRemarks: doc.gateOutRemarks || "",
         gateOutReversalRequestedAt: doc.gateOutReversalRequestedAt,
         gateOutReversalRequestReason: doc.gateOutReversalRequestReason || "",
@@ -619,6 +657,7 @@ const safeBooking = (booking) => {
         gateOutReversalAdminRemarks: doc.gateOutReversalAdminRemarks || "",
         gateOutReversalCount: Number(doc.gateOutReversalCount) || 0,
         releasedAt: doc.releasedAt,
+        releasedByName: releasedBy?.name || "",
         releaseRemarks: doc.releaseRemarks || "",
         releaseReport: doc.releaseReport ? String(doc.releaseReport?._id || doc.releaseReport) : "",
         reportGeneratedAt: doc.reportGeneratedAt,
@@ -1027,7 +1066,7 @@ const handleValidationError = (error, res) => {
     throw error;
 };
 const createClientBooking = async (req, res) => {
-    const { containerNumber, containerSize, containerType, containerLoadStatus, serviceType, rateType, shippingLine, truckPlateNumber, driverName, driverLicenseNumber, blNumber, vesselVoyage, cargoDescription, weight, expectedArrivalDate, inDate, outDate, clientRemarks, } = req.body;
+    const { containerNumber, containerSize, containerType, containerLoadStatus, serviceType, rateType, shippingLine, truckPlateNumber, driverName, driverLicenseNumber, hauler, blNumber, vesselVoyage, cargoDescription, weight, expectedArrivalDate, inDate, outDate, clientRemarks, } = req.body;
     const requiredFields = [containerNumber, containerSize, containerType, rateType, shippingLine, inDate || expectedArrivalDate, truckPlateNumber, driverName, weight];
     if (requiredFields.some((value) => !String(value || "").trim())) {
         return res.status(400).json({ success: false, message: "Please complete all required booking fields." });
@@ -1091,6 +1130,7 @@ const createClientBooking = async (req, res) => {
         truckPlateNumber: truckPlateNumber || "",
         driverName: driverName || "",
         driverLicenseNumber: driverLicenseNumber || "",
+        hauler: hauler || "",
         blNumber: blNumber || "",
         vesselVoyage: vesselVoyage || "",
         cargoDescription: cargoDescription || "",
@@ -1136,7 +1176,7 @@ const resubmitClientBooking = async (req, res) => {
     if (booking.status !== "rejected") {
         return res.status(400).json({ success: false, message: "Only rejected bookings can be resubmitted." });
     }
-    const { containerNumber, containerSize, containerType, containerLoadStatus, serviceType, rateType, shippingLine, truckPlateNumber, driverName, driverLicenseNumber, blNumber, vesselVoyage, cargoDescription, weight, expectedArrivalDate, inDate, outDate, clientRemarks, } = req.body;
+    const { containerNumber, containerSize, containerType, containerLoadStatus, serviceType, rateType, shippingLine, truckPlateNumber, driverName, driverLicenseNumber, hauler, blNumber, vesselVoyage, cargoDescription, weight, expectedArrivalDate, inDate, outDate, clientRemarks, } = req.body;
     const requiredFields = [containerNumber, containerSize, containerType, rateType, shippingLine, inDate || expectedArrivalDate, truckPlateNumber, driverName, weight];
     if (requiredFields.some((value) => !String(value || "").trim())) {
         return res.status(400).json({ success: false, message: "Please complete all required booking fields before resubmitting." });
@@ -1180,6 +1220,7 @@ const resubmitClientBooking = async (req, res) => {
     booking.truckPlateNumber = truckPlateNumber || "";
     booking.driverName = driverName || "";
     booking.driverLicenseNumber = driverLicenseNumber || "";
+    booking.hauler = hauler || "";
     booking.blNumber = blNumber || "";
     booking.vesselVoyage = vesselVoyage || "";
     booking.cargoDescription = cargoDescription || "";
@@ -1527,15 +1568,21 @@ const approveBookingGateIn = async (req, res) => {
         return res.status(400).json({ success: false, message: "Truck plate number and driver name must be added in the booking before Gate-In." });
     }
     const receivedAt = new Date();
+    const gateInConditions = normalizeConditionSelections(req.body.gateInConditions || req.body.conditions);
+    const gateInConditionOther = String(req.body.gateInConditionOther || "").trim();
     booking.status = "gate_in_approved";
     booking.gateInApprovedAt = receivedAt;
     booking.gateInApprovedBy = req.user._id;
     booking.actualContainerNumber = actualContainerNumber;
-    booking.physicalCondition = req.body.physicalCondition || "Good";
+    booking.gateInConditions = gateInConditions.length ? gateInConditions : ["GOOD"];
+    booking.gateInConditionOther = gateInConditionOther;
+    booking.physicalCondition = buildConditionSummary(booking.gateInConditions, gateInConditionOther);
     booking.sealNumber = req.body.sealNumber || "";
+    booking.sealIntact = normalizeYesNo(req.body.sealIntact || booking.sealIntact);
     booking.truckPlateNumber = booking.truckPlateNumber || req.body.truckPlateNumber || "";
     booking.driverName = booking.driverName || req.body.driverName || "";
     booking.driverLicenseNumber = booking.driverLicenseNumber || req.body.driverLicenseNumber || "";
+    booking.hauler = booking.hauler || req.body.hauler || "";
     booking.inspectionRemarks = req.body.inspectionRemarks || "";
     addHistory(booking, {
         remarks: "Gate-In approved. Container added to Inventory and is awaiting storage confirmation.",
@@ -1545,6 +1592,7 @@ const approveBookingGateIn = async (req, res) => {
     await booking.populate("client", "name email companyName phoneNumber");
     await booking.populate("assignedArea", "name code isCongestionArea");
     await booking.populate("assignedBlock", "name code");
+    await booking.populate("gateInApprovedBy", "name");
     const payload = safeBooking(booking);
     (0, socket_js_1.emitToAdmins)("booking:gate_in_approved", payload);
     (0, socket_js_1.emitToAdmins)("inventory:container_created", payload);
@@ -2297,6 +2345,7 @@ const approveBookingGateOut = async (req, res) => {
     await booking.populate("client", "name email companyName phoneNumber");
     await booking.populate("assignedArea", "name code isCongestionArea");
     await booking.populate("assignedBlock", "name code");
+    await booking.populate("gateOutApprovedBy", "name");
     const payload = safeBooking(booking);
     (0, socket_js_1.emitToAdmins)("booking:gate_out_approved", payload);
     (0, socket_js_1.emitToUser)(booking.client?._id || booking.client, "booking:gate_out_approved", payload);
@@ -2492,10 +2541,14 @@ const completeBookingGateOut = async (req, res) => {
         vatAmount: Number(booking.vatAmount) || 0,
         total: Number(booking.billingTotal || booking.paymentAmount) || 0,
     };
+    const gateOutConditions = normalizeConditionSelections(req.body.gateOutConditions || booking.gateOutConditions || booking.gateInConditions);
+    const gateOutConditionOther = String(req.body.gateOutConditionOther || booking.gateOutConditionOther || "").trim();
     booking.status = "completed_gate_out_done";
     booking.releasedAt = releasedAt;
     booking.releasedBy = booking.releasedBy || req.user._id;
     booking.releaseRemarks = req.body.remarks || booking.releaseRemarks || "";
+    booking.gateOutConditions = gateOutConditions.length ? gateOutConditions : normalizeConditionSelections(booking.gateInConditions || ["GOOD"]);
+    booking.gateOutConditionOther = gateOutConditionOther;
     if (!wasAlreadyCompleted) {
         addHistory(booking, { remarks: `Container released, final report generated, and PHP ${billingResult.total.toLocaleString()} revenue recorded.`, changedBy: req.user._id });
     }
@@ -2538,6 +2591,8 @@ const completeBookingGateOut = async (req, res) => {
     await booking.populate("client", "name email companyName phoneNumber");
     await booking.populate("assignedArea", "name code isCongestionArea");
     await booking.populate("assignedBlock", "name code");
+    await booking.populate("gateOutApprovedBy", "name");
+    await booking.populate("releasedBy", "name");
     const payload = safeBooking(booking);
     (0, socket_js_1.emitToAdmins)("booking:completed", payload);
     (0, socket_js_1.emitToAdmins)("report:generated", { booking: payload, reportId: String(releaseReport._id), reportNumber, revenue: releaseReport.revenueTotal });
