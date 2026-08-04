@@ -61,6 +61,50 @@ const getReservedSlotKeys = ({ bay, row, tier, containerSize, yardContainerSize 
     }
     return keys;
 };
+const getBlockOccupancySnapshot = async (block) => {
+    const [otherInventory, activeBookings] = await Promise.all([
+        InventoryContainer_js_1.default.find({ block: block._id, status: { $ne: "released" } }).select("containerSize bay row tier"),
+        Booking_js_1.default.find({
+            assignedBlock: block._id,
+            status: { $in: ["approved_area_assigned", "gate_in_approved", "stored_in_assigned_area", "gate_out_requested", "gate_out_approved", "gate_out_reversal_requested"] },
+        }).select("containerSize assignedBay assignedRow assignedTier"),
+    ]);
+    const occupiedKeys = new Set([
+        ...otherInventory.flatMap((item) => getReservedSlotKeys({ bay: item.bay, row: item.row, tier: item.tier, containerSize: item.containerSize, yardContainerSize: block.containerSize })),
+        ...activeBookings.flatMap((item) => getReservedSlotKeys({ bay: item.assignedBay, row: item.assignedRow, tier: item.assignedTier, containerSize: item.containerSize, yardContainerSize: block.containerSize })),
+    ]);
+    const usedCapacity = [...otherInventory, ...activeBookings].reduce((total, item) => total + getYardCapacityUsage(item.containerSize, block.containerSize), 0);
+    return { occupiedKeys, usedCapacity };
+};
+const findAvailableYardLocation = async ({ area, requestedBlockId = "", containerSize }) => {
+    const query = { area: area._id, status: { $in: ["active", "full"] } };
+    if (requestedBlockId) query._id = requestedBlockId;
+    const blocks = await YardBlock_js_1.default.find(query).sort({ code: 1, name: 1 });
+    const preferred = [...blocks].sort((left, right) => {
+        const leftExact = Number(left.containerSize) === Number(containerSize) ? 0 : 1;
+        const rightExact = Number(right.containerSize) === Number(containerSize) ? 0 : 1;
+        return leftExact - rightExact || String(left.code || left.name || "").localeCompare(String(right.code || right.name || ""));
+    });
+    for (const block of preferred) {
+        const requiredCapacity = getYardCapacityUsage(Number(containerSize), block.containerSize);
+        const { occupiedKeys, usedCapacity } = await getBlockOccupancySnapshot(block);
+        if (usedCapacity + requiredCapacity > Number(block.teuSlots || 0)) continue;
+        const bayCount = Math.max(Number(block.bayCount) || 1, 1);
+        const rowCount = Math.max(Number(block.rowCount) || 1, 1);
+        const tierCount = Math.max(Number(block.tierCount) || 1, 1);
+        for (let tier = 1; tier <= tierCount; tier += 1) {
+            for (let row = 1; row <= rowCount; row += 1) {
+                for (let bay = 1; bay <= bayCount; bay += 1) {
+                    const requestedKeys = getReservedSlotKeys({ bay, row, tier, containerSize: Number(containerSize), yardContainerSize: block.containerSize });
+                    if (requestedKeys.length === 2 && bay + 1 > bayCount) continue;
+                    if (requestedKeys.some((key) => occupiedKeys.has(key))) continue;
+                    return { block, bay, row, tier };
+                }
+            }
+        }
+    }
+    throw Object.assign(new Error("The selected yard area has no available slot for this container size."), { statusCode: 409 });
+};
 const recalculateBlockOccupancy = async (blockId) => {
     if (!blockId)
         return;
@@ -104,7 +148,7 @@ const safeBookingContainer = (booking) => {
         gateIn: "",
         preAdviceNumber: "",
         gateInNumber: "",
-        client: client?._id ? String(client._id) : String(doc.client),
+        client: client?._id ? String(client._id) : doc.client ? String(doc.client) : "",
         clientName: client.companyName || client.name || "",
         containerNumber: doc.containerNumber,
         containerSize: doc.containerSize,
@@ -241,6 +285,9 @@ const createLegacyInventoryContainer = async (req, res) => {
         driverName,
         driverLicenseNumber,
         hauler,
+        scheduledDateIn,
+        scheduledTimeIn,
+        scheduledDateTimeIn,
         historicalGateInDate,
         historicalGateInDateType,
         historicalSourceReference,
@@ -257,9 +304,12 @@ const createLegacyInventoryContainer = async (req, res) => {
         inspectionRemarks,
         gateInConditionOther,
     } = req.body;
-    const required = [clientId, containerNumber, containerSize, containerType, containerLoadStatus, rateType, shippingLine, areaId, blockId, legacyRegistrationReason];
+    const required = [containerNumber, containerSize, containerType, containerLoadStatus, rateType, scheduledDateIn, scheduledTimeIn, shippingLine, areaId];
     if (required.some((value) => !String(value || "").trim())) {
-        return res.status(400).json({ success: false, message: "Complete all required existing-container fields." });
+        return res.status(400).json({
+            success: false,
+            message: "Complete the required fields: Container Number, Container Size, Type, Load Status, Transaction Classification, Scheduled Date In, Scheduled Time In, Shipping Line, and Yard Area.",
+        });
     }
     if (![20, 40].includes(Number(containerSize))) {
         return res.status(400).json({ success: false, message: "Container size must be 20ft or 40ft." });
@@ -270,9 +320,12 @@ const createLegacyInventoryContainer = async (req, res) => {
     if (!["local", "international"].includes(String(rateType).toLowerCase())) {
         return res.status(400).json({ success: false, message: "Select Local or International rate classification." });
     }
-    const client = await User_js_1.default.findOne({ _id: clientId, userType: "client", status: { $in: ["verified", "active"] } });
-    if (!client) {
-        return res.status(404).json({ success: false, message: "Verified client account not found." });
+    let client = null;
+    if (String(clientId || "").trim()) {
+        client = await User_js_1.default.findOne({ _id: clientId, userType: "client", status: { $in: ["verified", "active"] } });
+        if (!client) {
+            return res.status(404).json({ success: false, message: "Verified client account not found." });
+        }
     }
     const normalizedContainer = normalizeContainerNumber(containerNumber);
     if (!normalizedContainer) {
@@ -285,55 +338,30 @@ const createLegacyInventoryContainer = async (req, res) => {
     if (activeBooking || activeInventory) {
         return res.status(409).json({ success: false, message: "This container number already has an active record." });
     }
-    const [area, block] = await Promise.all([
-        YardArea_js_1.default.findById(areaId),
-        YardBlock_js_1.default.findById(blockId),
-    ]);
-    if (!area || !block || String(block.area) !== String(area._id)) {
-        return res.status(404).json({ success: false, message: "The selected yard area or block is invalid." });
+    const area = await YardArea_js_1.default.findById(areaId);
+    if (!area) {
+        return res.status(404).json({ success: false, message: "The selected yard area is invalid." });
     }
-    if (!['active', 'full'].includes(block.status)) {
-        return res.status(400).json({ success: false, message: "Existing containers can only be registered in active yard blocks." });
+    let location;
+    try {
+        location = await findAvailableYardLocation({ area, requestedBlockId: blockId || "", containerSize: Number(containerSize) });
     }
-    const nextBay = Math.max(toNumber(bay, 1), 1);
-    const nextRow = Math.max(toNumber(row, 1), 1);
-    const nextTier = Math.max(toNumber(tier, 1), 1);
-    if (nextBay > block.bayCount || nextRow > block.rowCount || nextTier > block.tierCount) {
-        return res.status(400).json({ success: false, message: `Location exceeds block limits: Bay ${block.bayCount}, Row ${block.rowCount}, Tier ${block.tierCount}.` });
+    catch (error) {
+        return res.status(error.statusCode || 400).json({ success: false, message: error.message || "No available yard location was found." });
     }
-    const requestedSlotKeys = getReservedSlotKeys({ bay: nextBay, row: nextRow, tier: nextTier, containerSize: Number(containerSize), yardContainerSize: block.containerSize });
-    if (requestedSlotKeys.length === 2 && nextBay + 1 > Number(block.bayCount || 1)) {
-        return res.status(400).json({ success: false, message: "A 40ft container needs two adjacent 20ft TEU slots." });
-    }
-    const [otherInventory, activeBookings] = await Promise.all([
-        InventoryContainer_js_1.default.find({ block: block._id, status: { $ne: "released" } }).select("containerSize bay row tier"),
-        Booking_js_1.default.find({
-            assignedBlock: block._id,
-            status: { $in: ["approved_area_assigned", "gate_in_approved", "stored_in_assigned_area", "gate_out_requested", "gate_out_approved", "gate_out_reversal_requested"] },
-        }).select("containerSize assignedBay assignedRow assignedTier"),
-    ]);
-    const occupiedKeys = new Set([
-        ...otherInventory.flatMap((item) => getReservedSlotKeys({ bay: item.bay, row: item.row, tier: item.tier, containerSize: item.containerSize, yardContainerSize: block.containerSize })),
-        ...activeBookings.flatMap((item) => getReservedSlotKeys({ bay: item.assignedBay, row: item.assignedRow, tier: item.assignedTier, containerSize: item.containerSize, yardContainerSize: block.containerSize })),
-    ]);
-    if (requestedSlotKeys.some((key) => occupiedKeys.has(key))) {
-        return res.status(409).json({ success: false, message: "One or both required yard slots are already occupied or reserved." });
-    }
-    const usedCapacity = [...otherInventory, ...activeBookings].reduce((total, item) => total + getYardCapacityUsage(item.containerSize, block.containerSize), 0);
-    if (usedCapacity + getYardCapacityUsage(Number(containerSize), block.containerSize) > Number(block.teuSlots)) {
-        return res.status(400).json({ success: false, message: "The selected block does not have enough available capacity." });
-    }
+    const block = location.block;
+    const nextBay = location.bay;
+    const nextRow = location.row;
+    const nextTier = location.tier;
     const migrationDate = new Date();
-    const dateType = ["exact", "estimated", "unknown"].includes(String(historicalGateInDateType)) ? String(historicalGateInDateType) : "unknown";
-    let historicalDate = migrationDate;
-    if (dateType !== "unknown") {
-        historicalDate = new Date(historicalGateInDate);
-        if (Number.isNaN(historicalDate.getTime())) {
-            return res.status(400).json({ success: false, message: "Provide a valid historical Gate-In date." });
-        }
-        if (historicalDate > migrationDate) {
-            return res.status(400).json({ success: false, message: "Historical Gate-In date cannot be in the future." });
-        }
+    const dateType = "exact";
+    const fallbackDateTime = `${String(scheduledDateIn).trim()}T${String(scheduledTimeIn).trim()}:00+08:00`;
+    const historicalDate = new Date(scheduledDateTimeIn || historicalGateInDate || fallbackDateTime);
+    if (Number.isNaN(historicalDate.getTime())) {
+        return res.status(400).json({ success: false, message: "Provide a valid Scheduled Date In and Scheduled Time In." });
+    }
+    if (historicalDate > migrationDate) {
+        return res.status(400).json({ success: false, message: "Scheduled Date In and Time In cannot be in the future for an existing stored container." });
     }
     const startMethod = billingStartMethod === "historical_gate_in" ? "historical_gate_in" : "migration_date";
     const storageStartDate = startMethod === "historical_gate_in" ? historicalDate : migrationDate;
@@ -343,8 +371,8 @@ const createLegacyInventoryContainer = async (req, res) => {
     if (req.file) {
         const stored = await (0, localFileStorage_js_1.saveUploadedFile)({
             file: req.file,
-            clientId: client._id,
-            clientName: client.companyName || client.name,
+            clientId: client?._id || req.user._id,
+            clientName: client?.companyName || client?.name || "Unassigned Legacy Container",
             category: "legacy-container",
             prefix: legacyRegistrationNumber,
         });
@@ -372,7 +400,7 @@ const createLegacyInventoryContainer = async (req, res) => {
         quantity: 1,
         rateAmount: openingBalance,
         amount: openingBalance,
-        notes: historicalSourceReference || legacyRegistrationReason,
+        notes: historicalSourceReference || legacyRegistrationReason || "Existing container registration",
         addedBy: req.user._id,
         addedAt: migrationDate,
     }] : [];
@@ -400,12 +428,12 @@ const createLegacyInventoryContainer = async (req, res) => {
         archivedAt: migrationDate,
     }] : [];
     const booking = await Booking_js_1.default.create({
-        client: client._id,
+        client: client?._id || null,
         recordSource: "legacy_migration",
         legacyRegistrationNumber,
         legacyRegisteredAt: migrationDate,
         legacyRegisteredBy: req.user._id,
-        legacyRegistrationReason: String(legacyRegistrationReason).trim(),
+        legacyRegistrationReason: String(legacyRegistrationReason || "Existing container registered manually from pre-system inventory records.").trim(),
         historicalGateInDateType: dateType,
         historicalSourceReference: String(historicalSourceReference || "").trim(),
         billingStartMethod: startMethod,
@@ -485,17 +513,19 @@ const createLegacyInventoryContainer = async (req, res) => {
     (0, socket_js_1.emitToAdmins)("inventory:legacy_container_created", { id: String(booking._id), bookingReference: booking.bookingReference, containerNumber: booking.containerNumber });
     (0, socket_js_1.emitToAdmins)("storage:updated", { id: String(booking._id), containerNumber: booking.containerNumber });
     (0, socket_js_1.emitToAdmins)("yard:slot_reserved", { id: String(booking._id), containerNumber: booking.containerNumber, blockId: String(block._id) });
-    (0, socket_js_1.emitToUser)(client._id, "booking:legacy_registered", { id: String(booking._id), bookingReference: booking.bookingReference, containerNumber: booking.containerNumber });
-    await (0, notificationService_js_1.createClientNotification)({
-        recipient: client._id,
-        type: "booking",
-        title: "Existing container added to inventory",
-        message: `Container ${booking.containerNumber} was registered in the OTLI inventory from historical company records.`,
-        booking: booking._id,
-        bookingReference: booking.bookingReference,
-        containerNumber: booking.containerNumber,
-        actionPath: "/booking-history",
-    });
+    if (client?._id) {
+        (0, socket_js_1.emitToUser)(client._id, "booking:legacy_registered", { id: String(booking._id), bookingReference: booking.bookingReference, containerNumber: booking.containerNumber });
+        await (0, notificationService_js_1.createClientNotification)({
+            recipient: client._id,
+            type: "booking",
+            title: "Existing container added to inventory",
+            message: `Container ${booking.containerNumber} was registered in the OTLI inventory from historical company records.`,
+            booking: booking._id,
+            bookingReference: booking.bookingReference,
+            containerNumber: booking.containerNumber,
+            actionPath: "/booking-history",
+        });
+    }
     return res.status(201).json({
         success: true,
         message: `Existing container registered as ${legacyRegistrationNumber}. Billing computed at PHP ${Number(billingResult.total || 0).toLocaleString()}.`,

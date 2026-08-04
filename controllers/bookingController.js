@@ -542,7 +542,7 @@ const safeBooking = (booking) => {
     const legacyRegisteredBy = doc.legacyRegisteredBy || null;
     return {
         id: String(doc._id),
-        client: client?._id ? String(client._id) : String(doc.client),
+        client: client?._id ? String(client._id) : doc.client ? String(doc.client) : "",
         recordSource: doc.recordSource || "client_booking",
         legacyRegistrationNumber: doc.legacyRegistrationNumber || "",
         legacyRegisteredAt: doc.legacyRegisteredAt,
@@ -722,6 +722,8 @@ const notifyEmail = async ({ to, subject, title, booking, message, details = [],
 const notifyClient = async (booking, title, message, details = [], options = {}) => {
     const populated = booking.client?.email ? booking : await booking.populate("client", "name email companyName");
     const recipient = populated.client?._id || populated.client;
+    if (!recipient)
+        return;
     await (0, notificationService_js_1.createClientNotification)({
         recipient,
         type: options.notificationType || "booking",
