@@ -70,6 +70,8 @@ router.patch("/bookings/:id/gate-out/approve", (0, authMiddleware_js_1.requirePe
 router.patch("/bookings/:id/gate-out/reject", (0, authMiddleware_js_1.requirePermission)("gateOut", "edit"), (0, asyncHandler_js_1.default)(bookingController_js_1.rejectBookingGateOut));
 router.patch("/bookings/:id/gate-out/reversal/approve", (0, authMiddleware_js_1.requirePermission)("gateOut", "edit"), (0, asyncHandler_js_1.default)(bookingController_js_1.approveGateOutReversal));
 router.patch("/bookings/:id/gate-out/reversal/reject", (0, authMiddleware_js_1.requirePermission)("gateOut", "edit"), (0, asyncHandler_js_1.default)(bookingController_js_1.rejectGateOutReversal));
+router.get("/bookings/:id/gate-out/billing-preview", (0, authMiddleware_js_1.requirePermission)("gateOut", "view"), (0, asyncHandler_js_1.default)(bookingController_js_1.previewGateOutBilling));
+router.patch("/bookings/:id/gate-out/recompute-billing", (0, authMiddleware_js_1.requirePermission)("gateOut", "edit"), (0, asyncHandler_js_1.default)(bookingController_js_1.recomputeGateOutBilling));
 router.patch("/bookings/:id/gate-out/complete", (0, authMiddleware_js_1.requirePermission)("gateOut", "edit"), (0, asyncHandler_js_1.default)(bookingController_js_1.completeBookingGateOut));
 router.get("/billing-rates", (0, authMiddleware_js_1.requirePermission)("rateSetup", "view"), (0, asyncHandler_js_1.default)(billingRateController_js_1.listBillingRates));
 router.post("/billing-rates/reference-defaults", (0, authMiddleware_js_1.requirePermission)("rateSetup", "create"), (0, asyncHandler_js_1.default)(billingRateController_js_1.seedReferenceBillingRates));

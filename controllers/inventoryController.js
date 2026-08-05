@@ -20,6 +20,29 @@ const toNumber = (value, fallback = 0) => {
 };
 const normalizeRateType = (value) => String(value || "").toLowerCase() === "international" ? "international" : "local";
 const normalizeContainerNumber = (value = "") => String(value).toUpperCase().replace(/[^A-Z0-9]/g, "").trim();
+const getInventoryGateOutSchedule = (booking = {}, asOf = new Date()) => {
+    const scheduledAt = booking.outDate ? new Date(booking.outDate) : null;
+    const gracePeriodMinutes = Math.max(Number(booking.gateOutGracePeriodMinutes ?? process.env.GATE_OUT_GRACE_PERIOD_MINUTES ?? 120) || 0, 0);
+    const overstayStartedAt = scheduledAt && !Number.isNaN(scheduledAt.getTime())
+        ? new Date(scheduledAt.getTime() + gracePeriodMinutes * 60 * 1000)
+        : null;
+    const approvedAndInside = ["gate_out_approved", "gate_out_reversal_requested"].includes(booking.status) && !booking.releasedAt;
+    const isOverstaying = Boolean(approvedAndInside && overstayStartedAt && asOf.getTime() > overstayStartedAt.getTime());
+    return {
+        gateOutGracePeriodMinutes: gracePeriodMinutes,
+        gateOutOverstayStartedAt: overstayStartedAt,
+        gateOutScheduleStatus: booking.releasedAt
+            ? "released"
+            : isOverstaying
+                ? "overstaying"
+                : approvedAndInside
+                    ? "awaiting_release"
+                    : scheduledAt
+                        ? "scheduled"
+                        : "not_scheduled",
+        isOverstaying,
+    };
+};
 const parseJsonArray = (value) => {
     if (Array.isArray(value)) return value;
     if (!value) return [];
@@ -129,6 +152,7 @@ const safeBookingContainer = (booking) => {
     const area = doc.assignedArea || null;
     const block = doc.assignedBlock || null;
     const legacyRegisteredBy = doc.legacyRegisteredBy || null;
+    const gateOutSchedule = getInventoryGateOutSchedule(doc);
     return {
         id: String(doc._id),
         source: "booking",
@@ -182,6 +206,10 @@ const safeBookingContainer = (booking) => {
         storageStartDate: doc.storageStartDate,
         inDate: doc.inDate || doc.expectedArrivalDate,
         outDate: doc.outDate,
+        gateOutGracePeriodMinutes: gateOutSchedule.gateOutGracePeriodMinutes,
+        gateOutScheduleStatus: gateOutSchedule.gateOutScheduleStatus,
+        gateOutOverstayStartedAt: gateOutSchedule.gateOutOverstayStartedAt,
+        isOverstaying: gateOutSchedule.isOverstaying,
         containerCondition: doc.physicalCondition || "",
         truckPlateNumber: doc.truckPlateNumber || "",
         driverName: doc.driverName || "",

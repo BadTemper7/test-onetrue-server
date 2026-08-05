@@ -140,7 +140,7 @@ const bookingSchema = new mongoose_1.default.Schema({
     },
     billingStatus: {
         type: String,
-        enum: ["unpaid", "payment_submitted", "payment_under_review", "payment_rejected", "paid_approved"],
+        enum: ["unpaid", "payment_submitted", "payment_under_review", "payment_rejected", "additional_payment_required", "paid_approved"],
         default: "unpaid",
         index: true,
     },
@@ -184,6 +184,11 @@ const bookingSchema = new mongoose_1.default.Schema({
     billingTotal: { type: Number, default: 0 },
     billingDays: { type: Number, default: 0 },
     billingComputedAt: { type: Date, default: null },
+    billingPreviousTotal: { type: Number, default: 0 },
+    billingRecomputedAt: { type: Date, default: null },
+    billingRecomputedBy: { type: mongoose_1.default.Schema.Types.ObjectId, ref: "User", default: null },
+    billingRecomputeReason: { type: String, default: "", trim: true },
+    billingRecomputeCount: { type: Number, default: 0 },
     paymentAmount: { type: Number, default: 0 },
     approvedPaymentAmount: { type: Number, default: 0 },
     paymentCreditAmount: { type: Number, default: 0 },
@@ -217,6 +222,14 @@ const bookingSchema = new mongoose_1.default.Schema({
     gateOutApprovedAt: { type: Date, default: null },
     gateOutApprovedBy: { type: mongoose_1.default.Schema.Types.ObjectId, ref: "User", default: null },
     gateOutPassNumber: { type: String, default: "", trim: true, index: true },
+    gateOutGracePeriodMinutes: { type: Number, default: 120, min: 0 },
+    gateOutScheduleStatus: {
+        type: String,
+        enum: ["not_scheduled", "scheduled", "awaiting_release", "overstaying", "released", "cancelled"],
+        default: "not_scheduled",
+        index: true,
+    },
+    gateOutOverstayStartedAt: { type: Date, default: null },
     gateOutRemarks: { type: String, default: "", trim: true },
     gateOutReversalRequestedAt: { type: Date, default: null },
     gateOutReversalRequestedBy: { type: mongoose_1.default.Schema.Types.ObjectId, ref: "User", default: null },
@@ -252,6 +265,8 @@ bookingSchema.pre("validate", function () {
     this.vatAmount = Math.max(Number(this.vatAmount) || 0, 0);
     this.billingTotal = Math.max(Number(this.billingTotal) || 0, 0);
     this.billingDays = Math.max(Number(this.billingDays) || 0, 0);
+    this.billingPreviousTotal = Math.max(Number(this.billingPreviousTotal) || 0, 0);
+    this.billingRecomputeCount = Math.max(Number(this.billingRecomputeCount) || 0, 0);
     this.paymentAmount = Math.max(Number(this.paymentAmount) || 0, 0);
     this.approvedPaymentAmount = Math.max(Number(this.approvedPaymentAmount) || 0, 0);
     this.paymentCreditAmount = Math.max(Number(this.paymentCreditAmount) || 0, 0);
@@ -259,6 +274,7 @@ bookingSchema.pre("validate", function () {
     this.openingBalanceAmount = Math.max(Number(this.openingBalanceAmount) || 0, 0);
     this.openingCreditAmount = Math.max(Number(this.openingCreditAmount) || 0, 0);
     this.gateOutReversalCount = Math.max(Number(this.gateOutReversalCount) || 0, 0);
+    this.gateOutGracePeriodMinutes = Math.max(Number(this.gateOutGracePeriodMinutes) || 0, 0);
     this.cashReceived = Math.max(Number(this.cashReceived) || 0, 0);
     this.changeAmount = Math.max(Number(this.changeAmount) || 0, 0);
     this.additionalBillingCharges = (this.additionalBillingCharges || []).map((item) => {

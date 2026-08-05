@@ -360,7 +360,7 @@ const getOperationsDashboard = async (req, res) => {
             .sort({ releasedAt: 1 })
             .lean(),
         Booking_js_1.default.find({ status: { $in: CURRENT_INVENTORY_STATUSES } })
-            .select("containerNumber containerSize status rateType client")
+            .select("containerNumber containerSize status rateType client outDate releasedAt gateOutGracePeriodMinutes")
             .lean(),
         YardBlock_js_1.default.find({ status: { $in: ["active", "full"] } }).select("teuSlots occupiedSlots").lean(),
         User_js_1.default.find().select("name email userType role status companyName createdAt").sort({ createdAt: -1 }).limit(10).lean(),
@@ -368,9 +368,17 @@ const getOperationsDashboard = async (req, res) => {
         Booking_js_1.default.countDocuments({ status: "pending_admin_approval" }),
         Booking_js_1.default.countDocuments({ status: "gate_out_requested" }),
     ]);
-    // A container is considered overstaying once its Gate-Out request has been
-    // approved but the physical release has not yet been completed.
-    const overstayingContainers = currentInventoryBookings.filter((booking) => booking.status === "gate_out_approved").length;
+    const dashboardNow = new Date();
+    const defaultGraceMinutes = Math.max(Number(process.env.GATE_OUT_GRACE_PERIOD_MINUTES ?? 120) || 0, 0);
+    const overstayingContainers = currentInventoryBookings.filter((booking) => {
+        if (!["gate_out_approved", "gate_out_reversal_requested"].includes(booking.status) || booking.releasedAt || !booking.outDate)
+            return false;
+        const scheduledAt = new Date(booking.outDate);
+        if (Number.isNaN(scheduledAt.getTime()))
+            return false;
+        const graceMinutes = Math.max(Number(booking.gateOutGracePeriodMinutes ?? defaultGraceMinutes) || 0, 0);
+        return dashboardNow.getTime() > scheduledAt.getTime() + graceMinutes * 60 * 1000;
+    }).length;
     const localContainers = currentInventoryBookings.filter((booking) => normalizeRateType(booking.rateType) === "local").length;
     const customerTotals = new Map();
     for (const report of periodReleaseReports) {
