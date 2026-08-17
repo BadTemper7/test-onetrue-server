@@ -561,6 +561,8 @@ const createLegacyInventoryContainer = async (req, res) => {
     });
 };
 exports.createLegacyInventoryContainer = createLegacyInventoryContainer;
+const INVENTORY_LIST_LIMIT = 1000;
+const INVENTORY_QUERY_LIMIT = INVENTORY_LIST_LIMIT + 1;
 const listInventoryContainers = async (req, res) => {
     const { areaId, status, search } = req.query;
     const query = {};
@@ -592,14 +594,14 @@ const listInventoryContainers = async (req, res) => {
             .populate("preAdvice", "preAdviceNumber status")
             .populate("gateIn", "gateInNumber status completedAt")
             .sort({ status: 1, createdAt: -1 })
-            .limit(300),
+            .limit(INVENTORY_QUERY_LIMIT),
         Booking_js_1.default.find(bookingQuery)
             .populate("client", "name email companyName")
             .populate("assignedArea", "name code")
             .populate("assignedBlock", "name code")
             .populate("legacyRegisteredBy", "name")
             .sort({ gateInApprovedAt: -1, storedAt: -1, updatedAt: -1 })
-            .limit(300),
+            .limit(INVENTORY_QUERY_LIMIT),
     ]);
     const combined = [...bookingContainers.map(safeBookingContainer), ...containers.map((container) => ({ ...safeContainer(container), source: "pre_advice" }))].sort((a, b) => {
         const aWaitingStorage = a.source === "booking" && a.bookingStatus === "gate_in_approved" ? 0 : 1;
@@ -610,7 +612,14 @@ const listInventoryContainers = async (req, res) => {
         const aEnteredAt = new Date(a.inventoryEnteredAt || a.gateInApprovedAt || a.storedAt || a.createdAt || 0).getTime();
         return bEnteredAt - aEnteredAt;
     });
-    return res.json({ success: true, containers: combined });
+    const limited = combined.slice(0, INVENTORY_LIST_LIMIT);
+    return res.json({
+        success: true,
+        containers: limited,
+        limit: INVENTORY_LIST_LIMIT,
+        returned: limited.length,
+        truncated: combined.length > INVENTORY_LIST_LIMIT,
+    });
 };
 exports.listInventoryContainers = listInventoryContainers;
 const assignInventoryContainer = async (req, res) => {
