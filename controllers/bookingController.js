@@ -459,6 +459,7 @@ const resolveBillingStage = (booking = {}, requestedStage = "auto") => {
     return "gate_in";
 };
 const isLiftOnLiftOffRate = (rate = {}) => /^(LIFT_ON|LIFT_OFF)(?:_|$)/.test(String(rate.chargeCode || "").toUpperCase());
+const getLoloPaymentStage = (booking = {}) => booking.loloPaymentStage === "gate_out" ? "gate_out" : "gate_in";
 const computeBookingBilling = async (booking, { asOf = new Date(), persist = false, useAsOfAsBillingEnd = false, phase = "auto" } = {}) => {
     const effectiveDate = new Date(asOf);
     const billingStage = resolveBillingStage(booking, phase);
@@ -469,7 +470,9 @@ const computeBookingBilling = async (booking, { asOf = new Date(), persist = fal
     }).sort({ sortOrder: 1, chargeCode: 1, effectiveDate: -1, createdAt: -1 });
     const applicableRates = activeRates.filter((rate) => rateMatchesBooking(rate, booking) && shouldApplyBillingRate(rate, booking));
     const stagedRates = billingStage === "gate_in"
-        ? applicableRates.filter(isLiftOnLiftOffRate)
+        ? getLoloPaymentStage(booking) === "gate_in"
+            ? applicableRates.filter(isLiftOnLiftOffRate)
+            : []
         : applicableRates;
     const matchedRates = getLatestRateByChargeCode(stagedRates);
     const storageDays = billingStage === "gate_out"
@@ -693,6 +696,7 @@ const safeBooking = (booking) => {
         inspectionRemarks: doc.inspectionRemarks || "",
         storedAt: doc.storedAt,
         storageStartDate: doc.storageStartDate,
+        loloPaymentStage: getLoloPaymentStage(doc),
         billingStage: doc.billingStage || resolveBillingStage(doc),
         billingLineItems: doc.billingLineItems || [],
         additionalBillingCharges: (doc.additionalBillingCharges || []).map((item) => ({
@@ -1576,6 +1580,11 @@ const approveBooking = async (req, res) => {
     booking.assignedAt = new Date();
     booking.assignedBy = req.user._id;
     booking.storageStartDate = booking.storageStartDate || booking.inDate || booking.expectedArrivalDate || booking.approvedAt;
+    const requestedLoloPaymentStage = String(req.body.loloPaymentStage || booking.loloPaymentStage || "gate_in").trim().toLowerCase();
+    if (!["gate_in", "gate_out"].includes(requestedLoloPaymentStage)) {
+        return res.status(400).json({ success: false, message: "LOLO payment collection must be set to Gate-In or Gate-Out." });
+    }
+    booking.loloPaymentStage = requestedLoloPaymentStage;
     const assignedToCongestionArea = Boolean(plan.area.isCongestionArea);
     let congestionOption = null;
     if (assignedToCongestionArea) {
@@ -1618,9 +1627,11 @@ const approveBooking = async (req, res) => {
     }
     const billingResult = await (0, exports.computeBookingBilling)(booking, { persist: true, phase: "gate_in" });
     addHistory(booking, {
-        remarks: billingResult.hasMatchedRates
-            ? `Booking approved and assigned to ${assignedToCongestionArea ? "the designated congestion area" : "a regular yard area"}. Gate-In LOLO billing is PHP ${billingResult.total.toLocaleString()}. Storage, congestion, and other charges will be computed during Gate-Out.`
-            : `Booking approved and assigned to ${assignedToCongestionArea ? "the designated congestion area" : "a regular yard area"}. Configure matching active Lift On and Lift Off rates before Gate-In payment and approval.`,
+        remarks: booking.loloPaymentStage === "gate_out"
+            ? `Booking approved and assigned to ${assignedToCongestionArea ? "the designated congestion area" : "a regular yard area"}. LOLO collection is deferred to Gate-Out. Storage, congestion, and other charges are also payable only at Gate-Out.`
+            : billingResult.hasMatchedRates
+                ? `Booking approved and assigned to ${assignedToCongestionArea ? "the designated congestion area" : "a regular yard area"}. Gate-In LOLO billing is PHP ${billingResult.total.toLocaleString()}. Storage, congestion, and other charges will be computed and collected during Gate-Out.`
+                : `Booking approved and assigned to ${assignedToCongestionArea ? "the designated congestion area" : "a regular yard area"}. Configure matching active Lift On and Lift Off rates before Gate-In payment and approval. Storage and other charges remain payable only at Gate-Out.`,
         changedBy: req.user._id,
     });
     await booking.save();
@@ -1647,7 +1658,9 @@ const approveBooking = async (req, res) => {
         qrCodeValue: booking.qrCodeValue,
         trackingUrl: getBookingTrackingUrl(booking.bookingNumber),
     });
-    return res.json({ success: true, message: "Booking approved, yard area assigned, and billing initialized.", booking: payload });
+    return res.json({ success: true, message: booking.loloPaymentStage === "gate_out"
+        ? "Booking approved and yard area assigned. LOLO payment will be collected at Gate-Out."
+        : "Booking approved, yard area assigned, and Gate-In LOLO billing initialized.", booking: payload });
 };
 exports.approveBooking = approveBooking;
 const rejectBooking = async (req, res) => {
@@ -1701,23 +1714,26 @@ const approveBookingGateIn = async (req, res) => {
     if (!booking.assignedArea || !booking.assignedBlock) {
         return res.status(400).json({ success: false, message: "Booking has no assigned yard area." });
     }
+    const loloPaymentStage = getLoloPaymentStage(booking);
     let gateInBillingResult = null;
-    if (booking.billingStage !== "gate_in" || !Array.isArray(booking.billingLineItems) || booking.billingLineItems.length === 0) {
-        gateInBillingResult = await (0, exports.computeBookingBilling)(booking, { persist: true, phase: "gate_in" });
-    }
-    else {
-        gateInBillingResult = {
-            hasMatchedRates: booking.billingLineItems.some((item) => /^(LIFT_ON|LIFT_OFF)(?:_|$)/.test(String(item.chargeCode || "").toUpperCase())),
-            total: Number(booking.billingTotal) || 0,
-        };
-        applyApprovedPaymentCredit(booking, booking.billingTotal);
-    }
-    if (!gateInBillingResult.hasMatchedRates || Number(gateInBillingResult.total || 0) <= 0) {
-        return res.status(400).json({ success: false, message: "Gate-In requires active Lift On and Lift Off billing rates before approval." });
-    }
-    if (booking.billingStatus !== "paid_approved" || Number(booking.paymentBalanceDue || 0) > 0) {
-        await booking.save();
-        return res.status(403).json({ success: false, message: `Gate-In LOLO payment must be fully paid and approved before Gate-In. Balance due: PHP ${Number(booking.paymentBalanceDue || booking.paymentAmount || 0).toLocaleString()}.` });
+    if (loloPaymentStage === "gate_in") {
+        if (booking.billingStage !== "gate_in" || !Array.isArray(booking.billingLineItems) || booking.billingLineItems.length === 0) {
+            gateInBillingResult = await (0, exports.computeBookingBilling)(booking, { persist: true, phase: "gate_in" });
+        }
+        else {
+            gateInBillingResult = {
+                hasMatchedRates: booking.billingLineItems.some((item) => /^(LIFT_ON|LIFT_OFF)(?:_|$)/.test(String(item.chargeCode || "").toUpperCase())),
+                total: Number(booking.billingTotal) || 0,
+            };
+            applyApprovedPaymentCredit(booking, booking.billingTotal);
+        }
+        if (!gateInBillingResult.hasMatchedRates || Number(gateInBillingResult.total || 0) <= 0) {
+            return res.status(400).json({ success: false, message: "Gate-In requires active Lift On and Lift Off billing rates before approval when LOLO is collected at Gate-In." });
+        }
+        if (booking.billingStatus !== "paid_approved" || Number(booking.paymentBalanceDue || 0) > 0) {
+            await booking.save();
+            return res.status(403).json({ success: false, message: `Gate-In LOLO payment must be fully paid and approved before Gate-In. Balance due: PHP ${Number(booking.paymentBalanceDue || booking.paymentAmount || 0).toLocaleString()}.` });
+        }
     }
     const actualContainerNumber = normalizeContainerNumber(req.body.actualContainerNumber || booking.containerNumber);
     if (actualContainerNumber !== booking.containerNumber) {
@@ -1745,7 +1761,9 @@ const approveBookingGateIn = async (req, res) => {
     booking.hauler = booking.hauler || req.body.hauler || "";
     booking.inspectionRemarks = req.body.inspectionRemarks || "";
     addHistory(booking, {
-        remarks: `Gate-In approved under pass ${booking.gateInPassNumber} after LOLO payment verification. Container added to Inventory and is awaiting storage confirmation.`,
+        remarks: loloPaymentStage === "gate_in"
+            ? `Gate-In approved under pass ${booking.gateInPassNumber} after LOLO payment verification. Container added to Inventory and is awaiting storage confirmation.`
+            : `Gate-In approved under pass ${booking.gateInPassNumber}. LOLO payment is deferred to Gate-Out by admin selection. Container added to Inventory and is awaiting storage confirmation.`,
         changedBy: req.user._id,
     });
     await booking.save();
@@ -1758,7 +1776,9 @@ const approveBookingGateIn = async (req, res) => {
     (0, socket_js_1.emitToAdmins)("inventory:container_created", payload);
     (0, socket_js_1.emitToAdmins)("inventory:updated", payload);
     (0, socket_js_1.emitToUser)(booking.client?._id || booking.client, "booking:gate_in_approved", payload);
-    await notifyClient(booking, "Gate-In approved", "Your LOLO payment was verified and the container passed Gate-In inspection. It is now listed in Inventory for storage confirmation.", [
+    await notifyClient(booking, "Gate-In approved", loloPaymentStage === "gate_in"
+        ? "Your LOLO payment was verified and the container passed Gate-In inspection. It is now listed in Inventory for storage confirmation."
+        : "The container passed Gate-In inspection. Your LOLO payment is scheduled for Gate-Out together with storage and other Gate-Out charges.", [
         { label: "Gate-In Pass No.", value: booking.gateInPassNumber },
         { label: "Container", value: booking.containerNumber },
         { label: "Truck Plate", value: booking.truckPlateNumber },
@@ -1823,9 +1843,11 @@ const markBookingStored = async (req, res) => {
     booking.storageStartDate = booking.storageStartDate || booking.inDate || storedAt;
     const billingResult = await (0, exports.computeBookingBilling)(booking, { persist: true, phase: "gate_in" });
     addHistory(booking, {
-        remarks: billingResult?.hasMatchedRates
-            ? `${wasAlreadyStored ? "Stored container Gate-In billing refreshed" : "Container stored in assigned yard location"}. Gate-In LOLO remains PHP ${billingResult.total.toLocaleString()}. Storage and other charges are deferred until Gate-Out.`
-            : "Container stored in the assigned yard location. Configure matching active Lift On and Lift Off rates for Gate-In billing; storage and other charges will be computed at Gate-Out.",
+        remarks: getLoloPaymentStage(booking) === "gate_out"
+            ? `${wasAlreadyStored ? "Stored container billing refreshed" : "Container stored in assigned yard location"}. LOLO, storage, congestion, and other charges are payable at Gate-Out.`
+            : billingResult?.hasMatchedRates
+                ? `${wasAlreadyStored ? "Stored container Gate-In billing refreshed" : "Container stored in assigned yard location"}. Gate-In LOLO remains PHP ${billingResult.total.toLocaleString()}. Storage and other charges are deferred until Gate-Out.`
+                : "Container stored in the assigned yard location. Configure matching active Lift On and Lift Off rates for Gate-In billing; storage and other charges will be computed at Gate-Out.",
         changedBy: req.user._id,
     });
     await booking.save();
@@ -2098,10 +2120,10 @@ const submitBookingPayment = async (req, res) => {
     const booking = await Booking_js_1.default.findOne({ _id: req.params.id, client: req.user._id });
     if (!booking)
         return res.status(404).json({ success: false, message: "Booking not found." });
-    const isGateInPayment = booking.status === "approved_area_assigned";
+    const isGateInPayment = booking.status === "approved_area_assigned" && getLoloPaymentStage(booking) === "gate_in";
     const isGateOutPayment = ["gate_out_requested", "gate_out_approved"].includes(booking.status) && Boolean(booking.outDate);
     if (!isGateInPayment && !isGateOutPayment) {
-        return res.status(400).json({ success: false, message: "Payment is available for Gate-In LOLO after yard assignment, or for the remaining Gate-Out balance after Date Out is submitted." });
+        return res.status(400).json({ success: false, message: getLoloPaymentStage(booking) === "gate_out" && booking.status === "approved_area_assigned" ? "LOLO payment is configured for Gate-Out for this booking. No payment is required at Gate-In." : "Payment is available for Gate-In LOLO when configured for Gate-In, or for the remaining Gate-Out balance after Date Out is submitted." });
     }
     if (["payment_submitted", "payment_under_review"].includes(booking.billingStatus)) {
         return res.status(409).json({ success: false, message: "A payment is already under review for this booking." });
@@ -2199,10 +2221,10 @@ exports.submitBookingPayment = submitBookingPayment;
 const recordAdminCashPayment = async (req, res) => {
     const booking = await Booking_js_1.default.findById(req.params.id);
     if (!booking) return res.status(404).json({ success: false, message: "Booking not found." });
-    const isGateInPayment = booking.status === "approved_area_assigned";
+    const isGateInPayment = booking.status === "approved_area_assigned" && getLoloPaymentStage(booking) === "gate_in";
     const isGateOutPayment = ["gate_out_requested", "gate_out_approved"].includes(booking.status) && Boolean(booking.outDate);
     if (!isGateInPayment && !isGateOutPayment) {
-        return res.status(400).json({ success: false, message: "Cash payment is available for Gate-In LOLO after yard assignment, or for the remaining Gate-Out balance after Date Out is submitted." });
+        return res.status(400).json({ success: false, message: getLoloPaymentStage(booking) === "gate_out" && booking.status === "approved_area_assigned" ? "LOLO payment is configured for Gate-Out for this booking. No cash payment is required at Gate-In." : "Cash payment is available for Gate-In LOLO when configured for Gate-In, or for the remaining Gate-Out balance after Date Out is submitted." });
     }
     if (booking.billingStatus === "paid_approved" && Number(booking.paymentBalanceDue || 0) <= 0) {
         return res.status(409).json({ success: false, message: "This billing stage is already fully paid." });
@@ -2441,7 +2463,7 @@ const requestBookingGateOut = async (req, res) => {
     booking.gateOutRequestedAt = new Date();
     booking.gateOutRequestRemarks = req.body.remarks || "";
     addHistory(booking, {
-        remarks: `Gate-out requested by client for ${gateOutDate.outDate.toLocaleString()}. Gross bill PHP ${billingResult.total.toLocaleString()}, approved payment credit PHP ${creditResult.approvedAmount.toLocaleString()}, balance due PHP ${creditResult.balanceDue.toLocaleString()}, using ${billingResult.days} calendar billing day${billingResult.days === 1 ? "" : "s"}.`,
+        remarks: `Gate-out requested by client for ${gateOutDate.outDate.toLocaleString()}. ${getLoloPaymentStage(booking) === "gate_out" ? "LOLO is collected in this Gate-Out bill together with storage and other charges." : "Previously approved Gate-In LOLO payment is applied as credit to the final Gate-Out bill."} Gross bill PHP ${billingResult.total.toLocaleString()}, approved payment credit PHP ${creditResult.approvedAmount.toLocaleString()}, balance due PHP ${creditResult.balanceDue.toLocaleString()}, using ${billingResult.days} calendar billing day${billingResult.days === 1 ? "" : "s"}.`,
         changedBy: req.user._id,
     });
     await booking.save();
