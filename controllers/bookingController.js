@@ -968,11 +968,12 @@ const getYardSpaceAvailability = async (containerSize, { areaType = "regular", e
     for (const block of eligibleBlocks) {
         const bookingFilter = activeBookingFilterForBlock(block._id);
         if (excludeBookingId) bookingFilter._id = { $ne: excludeBookingId };
-        const [inventoryContainers, bookingContainers] = await Promise.all([
+        const [inventoryContainers, bookingContainers, confirmedPreAdvices] = await Promise.all([
             InventoryContainer_js_1.default.find({ block: block._id, status: { $ne: "released" } }).select("containerSize"),
             Booking_js_1.default.find(bookingFilter).select("containerSize"),
+            PreAdvice_js_1.default.find({ plannedBlock: block._id, status: "confirmed" }).select("containerSize"),
         ]);
-        const usedCapacity = [...inventoryContainers, ...bookingContainers].reduce((total, item) => total + getYardCapacityUsage(item.containerSize, block.containerSize), 0);
+        const usedCapacity = [...inventoryContainers, ...bookingContainers, ...confirmedPreAdvices].reduce((total, item) => total + getYardCapacityUsage(item.containerSize, block.containerSize), 0);
         const requiredCapacity = getYardCapacityUsage(containerSize, block.containerSize);
         const remaining = Math.max(Number(block.teuSlots) - usedCapacity, 0);
         availableCapacity += remaining;
@@ -1090,20 +1091,22 @@ const validateYardAssignment = async ({ areaId, blockId, bay, row, tier, contain
         error.statusCode = 400;
         throw error;
     }
-    const [inventoryContainers, bookingContainers] = await Promise.all([
+    const [inventoryContainers, bookingContainers, confirmedPreAdvices] = await Promise.all([
         InventoryContainer_js_1.default.find({ block: block._id, status: { $ne: "released" } }).select("containerSize bay row tier"),
         Booking_js_1.default.find({ _id: { $ne: bookingId }, assignedBlock: block._id, status: { $nin: TERMINAL_BOOKING_STATUSES } }).select("containerSize assignedBay assignedRow assignedTier"),
+        PreAdvice_js_1.default.find({ plannedBlock: block._id, status: "confirmed" }).select("containerSize plannedBay plannedRow plannedTier"),
     ]);
     const occupiedKeys = new Set([
         ...inventoryContainers.flatMap((item) => getReservedSlotKeys({ bay: item.bay, row: item.row, tier: item.tier, containerSize: item.containerSize, yardContainerSize: block.containerSize })),
         ...bookingContainers.flatMap((item) => getReservedSlotKeys({ bay: item.assignedBay, row: item.assignedRow, tier: item.assignedTier, containerSize: item.containerSize, yardContainerSize: block.containerSize })),
+        ...confirmedPreAdvices.flatMap((item) => getReservedSlotKeys({ bay: item.plannedBay, row: item.plannedRow, tier: item.plannedTier, containerSize: item.containerSize, yardContainerSize: block.containerSize })),
     ]);
     if (requestedSlotKeys.some((key) => occupiedKeys.has(key))) {
         const error = new Error("The selected location does not have the required adjacent slot capacity.");
         error.statusCode = 409;
         throw error;
     }
-    const usedCapacity = [...inventoryContainers, ...bookingContainers].reduce((total, item) => total + getYardCapacityUsage(item.containerSize, block.containerSize), 0);
+    const usedCapacity = [...inventoryContainers, ...bookingContainers, ...confirmedPreAdvices].reduce((total, item) => total + getYardCapacityUsage(item.containerSize, block.containerSize), 0);
     const containerCapacity = getYardCapacityUsage(containerSize, block.containerSize);
     const capacityUnit = getYardCapacityUnit(block.containerSize);
     if (usedCapacity + containerCapacity > Number(block.teuSlots)) {
