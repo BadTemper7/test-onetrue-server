@@ -59,6 +59,7 @@ const statusHistorySchema = new mongoose_1.default.Schema({
 }, { _id: false });
 const paymentTransactionSchema = new mongoose_1.default.Schema({
     amount: { type: Number, default: 0, min: 0 },
+    billingStage: { type: String, enum: ["gate_in", "gate_out"], default: undefined },
     subtotal: { type: Number, default: 0, min: 0 },
     isVatApplicable: { type: Boolean, default: true },
     vatRate: { type: Number, default: 0, min: 0 },

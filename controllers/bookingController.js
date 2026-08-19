@@ -408,9 +408,10 @@ const archiveCurrentApprovedPayment = (booking, { approvedBy = null, source = "l
         return sameReference || sameReceipt || (noIdentifiers && roundMoney(item.amount) === amount);
     });
     if (!alreadyArchived && (amount > 0 || referenceNumber || receiptNumber)) {
-        const lineItemSnapshot = (booking.billingLineItems || []).map((item) => item.toObject ? item.toObject() : { ...item });
+        const billingSnapshot = buildPaymentBillingSnapshot(booking);
+        const lineItemSnapshot = [...billingSnapshot.lineItems];
         if (lineItemSnapshot.length === 0 && amount > 0) {
-            const fallbackSubtotal = roundMoney(Number(booking.billingSubtotal) || amount);
+            const fallbackSubtotal = roundMoney(Number(billingSnapshot.subtotal) || amount);
             lineItemSnapshot.push({
                 rate: null,
                 chargeCode: booking.recordSource === "legacy_migration" ? "LEGACY_BILLING_AMOUNT" : "BILLING_AMOUNT",
@@ -430,11 +431,12 @@ const archiveCurrentApprovedPayment = (booking, { approvedBy = null, source = "l
         }
         booking.paymentTransactions.push({
             amount,
-            subtotal: roundMoney(booking.billingSubtotal),
+            billingStage: billingSnapshot.billingStage,
+            subtotal: billingSnapshot.subtotal,
             isVatApplicable: booking.isVatApplicable !== false,
             vatRate: Number(booking.vatRate) || 0,
-            vatAmount: roundMoney(booking.vatAmount),
-            grossTotal: roundMoney(booking.billingTotal),
+            vatAmount: billingSnapshot.vatAmount,
+            grossTotal: billingSnapshot.grossTotal,
             lineItems: lineItemSnapshot,
             paymentTypeSnapshot: booking.paymentTypeSnapshot || {},
             referenceNumber,
@@ -479,7 +481,89 @@ const resolveBillingStage = (booking = {}, requestedStage = "auto") => {
     return "gate_in";
 };
 const isLiftOnLiftOffRate = (rate = {}) => /^(LIFT_ON|LIFT_OFF)(?:_|$)/.test(String(rate.chargeCode || "").toUpperCase());
+const isLiftOnLiftOffLineItem = (item = {}) => /^(LIFT_ON|LIFT_OFF)(?:_|$)/.test(String(item.chargeCode || "").toUpperCase());
 const getLoloPaymentStage = (booking = {}) => booking.loloPaymentStage === "gate_out" ? "gate_out" : "gate_in";
+const toBillingLineItemSnapshot = (item = {}) => ({
+    rate: item.rate?._id || item.rate || null,
+    chargeCode: item.chargeCode || "",
+    description: item.description || "",
+    unit: item.unit || "per_container",
+    quantity: Number(item.quantity) || 0,
+    rateAmount: Number(item.rateAmount) || 0,
+    freeDays: Number(item.freeDays) || 0,
+    minimumAmount: Number(item.minimumAmount) || 0,
+    category: item.category || "",
+    billingScope: item.billingScope || "",
+    rateType: normalizeRateType(item.rateType),
+    amount: roundMoney(item.amount),
+});
+const getArchivedGateInBillingSnapshot = (booking = {}) => {
+    if (getLoloPaymentStage(booking) !== "gate_in")
+        return null;
+    const transactions = Array.isArray(booking.paymentTransactions) ? [...booking.paymentTransactions] : [];
+    transactions.sort((left, right) => new Date(left.approvedAt || left.archivedAt || left.paymentDate || 0).getTime() - new Date(right.approvedAt || right.archivedAt || right.paymentDate || 0).getTime());
+    const gateInTransaction = transactions.find((transaction) => {
+        const items = Array.isArray(transaction.lineItems) ? transaction.lineItems : [];
+        if (transaction.billingStage === "gate_in")
+            return items.some(isLiftOnLiftOffLineItem);
+        return items.length > 0 && items.every(isLiftOnLiftOffLineItem);
+    });
+    if (!gateInTransaction)
+        return null;
+    const lineItems = (gateInTransaction.lineItems || []).filter(isLiftOnLiftOffLineItem).map(toBillingLineItemSnapshot);
+    const subtotal = roundMoney(lineItems.reduce((sum, item) => sum + (Number(item.amount) || 0), 0));
+    const transactionVatRate = gateInTransaction.isVatApplicable === false ? 0 : Math.max(Number(gateInTransaction.vatRate) || 0, 0);
+    const storedVatAmount = roundMoney(gateInTransaction.vatAmount);
+    const vatAmount = gateInTransaction.isVatApplicable === false
+        ? 0
+        : storedVatAmount > 0
+            ? storedVatAmount
+            : roundMoney(subtotal * transactionVatRate);
+    return { lineItems, subtotal, vatAmount, grossTotal: roundMoney(subtotal + vatAmount) };
+};
+const buildPaymentBillingSnapshot = (booking = {}) => {
+    const billingStage = booking.billingStage === "gate_in" ? "gate_in" : "gate_out";
+    const currentItems = (booking.billingLineItems || []).map((item) => toBillingLineItemSnapshot(item.toObject ? item.toObject() : item));
+    let lineItems = currentItems;
+    let subtotal = roundMoney(booking.billingSubtotal);
+    let vatAmount = roundMoney(booking.vatAmount);
+    let grossTotal = roundMoney(booking.billingTotal);
+    if (billingStage === "gate_out" && getLoloPaymentStage(booking) === "gate_in") {
+        const gateOutItems = currentItems.filter((item) => !isLiftOnLiftOffLineItem(item));
+        const priorGateOutTransactions = (booking.paymentTransactions || []).filter((transaction) => transaction.billingStage === "gate_out");
+        const priorAmounts = new Map();
+        for (const transaction of priorGateOutTransactions) {
+            for (const item of transaction.lineItems || []) {
+                if (isLiftOnLiftOffLineItem(item))
+                    continue;
+                const key = `${String(item.chargeCode || "").toUpperCase()}|${String(item.description || "").toUpperCase()}|${Number(item.rateAmount) || 0}`;
+                priorAmounts.set(key, roundMoney((priorAmounts.get(key) || 0) + (Number(item.amount) || 0)));
+            }
+        }
+        lineItems = gateOutItems.map((item) => {
+            const key = `${String(item.chargeCode || "").toUpperCase()}|${String(item.description || "").toUpperCase()}|${Number(item.rateAmount) || 0}`;
+            const previousAmount = priorAmounts.get(key) || 0;
+            const remainingAmount = roundMoney(Math.max((Number(item.amount) || 0) - previousAmount, 0));
+            if (remainingAmount <= 0)
+                return null;
+            const rateAmount = Number(item.rateAmount) || 0;
+            return {
+                ...item,
+                amount: remainingAmount,
+                quantity: rateAmount > 0 ? Math.round((remainingAmount / rateAmount) * 100) / 100 : item.quantity,
+            };
+        }).filter(Boolean);
+        const gateOutSubtotal = roundMoney(gateOutItems.reduce((sum, item) => sum + (Number(item.amount) || 0), 0));
+        const priorGateOutSubtotal = roundMoney(priorGateOutTransactions.reduce((sum, transaction) => sum + (Number(transaction.subtotal) || 0), 0));
+        const priorGateOutVat = roundMoney(priorGateOutTransactions.reduce((sum, transaction) => sum + (Number(transaction.vatAmount) || 0), 0));
+        subtotal = roundMoney(Math.max(gateOutSubtotal - priorGateOutSubtotal, 0));
+        const vatRate = booking.isVatApplicable === false ? 0 : Math.max(Number(booking.vatRate) || 0, 0);
+        const gateOutVatTotal = roundMoney(gateOutSubtotal * vatRate);
+        vatAmount = roundMoney(Math.max(gateOutVatTotal - priorGateOutVat, 0));
+        grossTotal = roundMoney(subtotal + vatAmount);
+    }
+    return { billingStage, lineItems, subtotal, vatAmount, grossTotal };
+};
 const computeBookingBilling = async (booking, { asOf = new Date(), persist = false, useAsOfAsBillingEnd = false, phase = "auto" } = {}) => {
     const effectiveDate = new Date(asOf);
     const billingStage = resolveBillingStage(booking, phase);
@@ -489,11 +573,16 @@ const computeBookingBilling = async (booking, { asOf = new Date(), persist = fal
         effectiveDate: { $lte: effectiveDate },
     }).sort({ sortOrder: 1, chargeCode: 1, effectiveDate: -1, createdAt: -1 });
     const applicableRates = activeRates.filter((rate) => rateMatchesBooking(rate, booking) && shouldApplyBillingRate(rate, booking));
+    const archivedGateInBilling = billingStage === "gate_out" ? getArchivedGateInBillingSnapshot(booking) : null;
+    const archivedGateInLoloItems = archivedGateInBilling?.lineItems || [];
+    const useArchivedGateInLolo = billingStage === "gate_out" && archivedGateInLoloItems.length > 0;
     const stagedRates = billingStage === "gate_in"
         ? getLoloPaymentStage(booking) === "gate_in"
             ? applicableRates.filter(isLiftOnLiftOffRate)
             : []
-        : applicableRates;
+        : useArchivedGateInLolo
+            ? applicableRates.filter((rate) => !isLiftOnLiftOffRate(rate))
+            : applicableRates;
     const matchedRates = getLatestRateByChargeCode(stagedRates);
     const storageDays = billingStage === "gate_out"
         ? getStorageDays(booking, effectiveDate, { useAsOfAsBillingEnd })
@@ -546,12 +635,17 @@ const computeBookingBilling = async (booking, { asOf = new Date(), persist = fal
             amount: Math.round((Number(item.amount) || ((Number(item.quantity) || 0) * (Number(item.rateAmount) || 0))) * 100) / 100,
         }))
         : [];
-    const allLineItems = [...lineItems, ...additionalLineItems];
+    const currentStageLineItems = [...lineItems, ...additionalLineItems];
+    const currentStageSubtotal = Math.round(currentStageLineItems.reduce((sum, item) => sum + item.amount, 0) * 100) / 100;
+    const allLineItems = [...archivedGateInLoloItems, ...currentStageLineItems];
     const subtotal = Math.round(allLineItems.reduce((sum, item) => sum + item.amount, 0) * 100) / 100;
     const configuredVatRate = Number(process.env.VAT_RATE ?? 0.12);
     const isVatApplicable = booking.isVatApplicable !== false;
     const vatRate = isVatApplicable && Number.isFinite(configuredVatRate) && configuredVatRate >= 0 ? configuredVatRate : 0;
-    const vatAmount = Math.round(subtotal * vatRate * 100) / 100;
+    const currentStageVatAmount = Math.round(currentStageSubtotal * vatRate * 100) / 100;
+    const vatAmount = useArchivedGateInLolo
+        ? roundMoney((Number(archivedGateInBilling?.vatAmount) || 0) + currentStageVatAmount)
+        : Math.round(subtotal * vatRate * 100) / 100;
     const total = Math.round((subtotal + vatAmount) * 100) / 100;
     const result = {
         billingStage,
@@ -563,7 +657,7 @@ const computeBookingBilling = async (booking, { asOf = new Date(), persist = fal
         total,
         days: storageDays,
         computedAt: effectiveDate,
-        hasMatchedRates: matchedRates.length > 0,
+        hasMatchedRates: matchedRates.length > 0 || archivedGateInLoloItems.length > 0,
     };
     if (persist) {
         booking.billingStage = billingStage;
@@ -751,6 +845,7 @@ const safeBooking = (booking) => {
         paymentTransactions: (doc.paymentTransactions || []).map((item) => ({
             id: String(item._id),
             amount: Number(item.amount) || 0,
+            billingStage: item.billingStage || ((item.lineItems || []).length > 0 && (item.lineItems || []).every(isLiftOnLiftOffLineItem) ? "gate_in" : "gate_out"),
             subtotal: Number(item.subtotal) || 0,
             isVatApplicable: item.isVatApplicable !== false,
             vatRate: Number(item.vatRate) || 0,
@@ -2298,7 +2393,9 @@ const submitBookingPayment = async (req, res) => {
         return res.status(409).json({ success: false, message: "A payment is already under review for this booking." });
     }
     const paymentStage = isGateInPayment ? "gate_in" : "gate_out";
-    booking.isVatApplicable = ![false, "false", "0", 0, "non_vat"].includes(req.body.isVatApplicable);
+    if (paymentStage === "gate_in" && req.body.isVatApplicable !== undefined) {
+        booking.isVatApplicable = ![false, "false", "0", 0, "non_vat"].includes(req.body.isVatApplicable);
+    }
     const billingResult = await (0, exports.computeBookingBilling)(booking, {
         asOf: isGateOutPayment ? booking.outDate : new Date(),
         persist: true,
@@ -2446,7 +2543,9 @@ const recordAdminCashPayment = async (req, res) => {
     if (additionalItems.length > 0) {
         booking.additionalBillingCharges.push(...additionalItems);
     }
-    booking.isVatApplicable = ![false, "false", "0", 0, "non_vat"].includes(req.body.isVatApplicable);
+    if (paymentStage === "gate_in" && req.body.isVatApplicable !== undefined) {
+        booking.isVatApplicable = ![false, "false", "0", 0, "non_vat"].includes(req.body.isVatApplicable);
+    }
     const billingResult = await (0, exports.computeBookingBilling)(booking, {
         asOf: isGateOutPayment ? booking.outDate : new Date(),
         persist: true,
