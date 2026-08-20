@@ -284,7 +284,7 @@ bookingSchema.pre("validate", function () {
         this.actualContainerNumber = String(this.actualContainerNumber).toUpperCase().replace(/[^A-Z0-9]/g, "").trim();
     }
     this.rateType = this.rateType === "international" ? "international" : "local";
-    this.loloPaymentStage = this.loloPaymentStage === "gate_out" ? "gate_out" : "gate_in";
+    this.loloPaymentStage = "gate_in";
     this.assignedBay = Math.max(Number(this.assignedBay) || 1, 1);
     this.assignedRow = Math.max(Number(this.assignedRow) || 1, 1);
     this.assignedTier = Math.max(Number(this.assignedTier) || 1, 1);
