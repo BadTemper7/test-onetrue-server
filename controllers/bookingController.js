@@ -2238,6 +2238,25 @@ const recordAdminCashPayment = async (req, res) => {
     if (!isGateInPayment && !isGateOutPayment) {
         return res.status(400).json({ success: false, message: getLoloPaymentStage(booking) === "gate_out" && booking.status === "approved_area_assigned" ? "LOLO payment is configured for Gate-Out for this booking. No cash payment is required at Gate-In." : "Cash payment is available for Gate-In LOLO when configured for Gate-In, or for the remaining Gate-Out balance after Date Out is submitted." });
     }
+    // Gate-In and Gate-Out are separate billing transactions. When a container
+    // reaches Gate-Out, always rebuild the Gate-Out bill so storage is computed
+    // from the storage start date through the requested Gate-Out date/time.
+    // A previous Gate-In LOLO payment is treated only as approved credit and
+    // must never make the Gate-Out transaction appear fully paid by itself.
+    if (isGateOutPayment) {
+        booking.isVatApplicable = ![false, "false", "0", 0, "non_vat"].includes(req.body.isVatApplicable ?? booking.isVatApplicable);
+        const gateOutBilling = await (0, exports.computeBookingBilling)(booking, {
+            asOf: booking.outDate,
+            persist: true,
+            phase: "gate_out",
+        });
+        if (!gateOutBilling.hasMatchedRates || gateOutBilling.total <= 0) {
+            return res.status(400).json({ success: false, message: "Complete Gate-Out Rate Setup before recording the payment." });
+        }
+        const gateOutCredit = applyApprovedPaymentCredit(booking, gateOutBilling.total);
+        booking.billingStatus = gateOutCredit.balanceDue <= 0 ? "paid_approved" : "unpaid";
+        await booking.save();
+    }
     if (booking.billingStatus === "paid_approved" && Number(booking.paymentBalanceDue || 0) <= 0) {
         return res.status(409).json({ success: false, message: "This billing stage is already fully paid." });
     }
@@ -3176,62 +3195,6 @@ const completeBookingGateOut = async (req, res) => {
     });
 };
 exports.completeBookingGateOut = completeBookingGateOut;
-const cancelExpiredGateInNoShows = async ({ now = new Date(), graceHours = Number(process.env.GATE_IN_NO_SHOW_GRACE_HOURS || 24) } = {}) => {
-    const safeGraceHours = Number.isFinite(Number(graceHours)) ? Math.max(Number(graceHours), 1) : 24;
-    const cutoff = new Date(new Date(now).getTime() - safeGraceHours * 60 * 60 * 1000);
-    const candidates = await Booking_js_1.default.find({
-        status: "approved_area_assigned",
-        gateInApprovedAt: null,
-        $or: [
-            { inDate: { $lte: cutoff } },
-            { inDate: null, expectedArrivalDate: { $lte: cutoff } },
-        ],
-    });
-    let cancelledCount = 0;
-    for (const booking of candidates) {
-        try {
-            const previousBlockId = booking.assignedBlock ? String(booking.assignedBlock) : "";
-            const previousSlot = booking.assignedSlotNumber || "";
-            const scheduledIn = booking.inDate || booking.expectedArrivalDate;
-            booking.status = "cancelled";
-            booking.rejectionReason = `Automatically cancelled after no Gate-In arrival within ${safeGraceHours} hours of the scheduled time.`;
-            booking.gateOutScheduleStatus = "cancelled";
-            booking.assignedArea = null;
-            booking.assignedBlock = null;
-            booking.assignedBay = 1;
-            booking.assignedRow = 1;
-            booking.assignedTier = 1;
-            booking.assignedSlotNumber = "";
-            booking.assignedAt = null;
-            booking.assignedBy = null;
-            booking.additionalBillingCharges = (booking.additionalBillingCharges || []).filter((item) => item.source !== "congestion_surcharge");
-            addHistory(booking, {
-                remarks: `System auto-cancelled this Gate-In no-show after ${safeGraceHours} hours. Scheduled Gate-In: ${scheduledIn ? new Date(scheduledIn).toLocaleString() : "-"}. Reserved yard slot ${previousSlot || "-"} was released.`,
-                changedBy: null,
-            });
-            await booking.save();
-            if (previousBlockId)
-                await recalculateBlockOccupancy(previousBlockId);
-            await booking.populate("client", "name email companyName phoneNumber");
-            const payload = safeBooking(booking);
-            (0, socket_js_1.emitToAdmins)("booking:gate_in_no_show_cancelled", payload);
-            (0, socket_js_1.emitToAdmins)("yard:slot_released", { ...payload, previousBlockId, previousSlot });
-            (0, socket_js_1.emitToAdmins)("inventory:updated", payload);
-            (0, socket_js_1.emitToUser)(booking.client?._id || booking.client, "booking:gate_in_no_show_cancelled", payload);
-            await notifyClient(booking, "Gate-In booking automatically cancelled", `No Gate-In arrival was recorded within ${safeGraceHours} hours after the scheduled Gate-In time, so the reservation was automatically cancelled and the yard slot was released.`, [
-                { label: "Container", value: booking.containerNumber },
-                { label: "Scheduled Gate-In", value: scheduledIn ? new Date(scheduledIn).toLocaleString() : "-" },
-                { label: "Released Slot", value: previousSlot || "-" },
-            ], { notificationType: "gate_in_no_show_cancelled" });
-            cancelledCount += 1;
-        }
-        catch (error) {
-            console.error(`Failed to auto-cancel Gate-In no-show ${booking?._id}:`, error);
-        }
-    }
-    return { cancelledCount, checkedCount: candidates.length, cutoff };
-};
-exports.cancelExpiredGateInNoShows = cancelExpiredGateInNoShows;
 const relocateBooking = async (req, res) => {
     const booking = await Booking_js_1.default.findById(req.params.id);
     if (!booking)
