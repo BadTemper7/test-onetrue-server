@@ -554,13 +554,17 @@ const buildPaymentBillingSnapshot = (booking = {}) => {
     let vatAmount = roundMoney(booking.vatAmount);
     let grossTotal = roundMoney(booking.billingTotal);
     if (billingStage === "gate_out" && getLoloPaymentStage(booking) === "gate_in") {
-        const gateOutItems = currentItems.filter((item) => !isLiftOnLiftOffLineItem(item));
+        // LOLO is excluded from Gate-Out only when it was actually paid at Gate-In.
+        // Legacy bookings may have Gate-In payments without any LOLO line item;
+        // those bookings must carry the missing LOLO charges into Gate-Out.
+        const hasPaidGateInLolo = Boolean(getArchivedGateInBillingSnapshot(booking));
+        const gateOutItems = hasPaidGateInLolo
+            ? currentItems.filter((item) => !isLiftOnLiftOffLineItem(item))
+            : currentItems;
         const priorGateOutTransactions = (booking.paymentTransactions || []).filter((transaction) => transaction.billingStage === "gate_out");
         const priorAmounts = new Map();
         for (const transaction of priorGateOutTransactions) {
             for (const item of transaction.lineItems || []) {
-                if (isLiftOnLiftOffLineItem(item))
-                    continue;
                 const key = `${String(item.chargeCode || "").toUpperCase()}|${String(item.description || "").toUpperCase()}|${Number(item.rateAmount) || 0}`;
                 priorAmounts.set(key, roundMoney((priorAmounts.get(key) || 0) + (Number(item.amount) || 0)));
             }
