@@ -24,6 +24,7 @@ const listPaymentHistory = async (req, res) => {
         .lean();
     const buildTransaction = (booking, payment = null, index = 0) => ({
         id: payment?._id ? `${booking._id}-${payment._id}` : String(booking._id),
+        paymentStage: payment?.paymentStage || (booking.loloPaymentStage === "gate_in" ? "gate_in" : "gate_out"),
         bookingId: String(booking._id),
         bookingReference: booking.bookingReference,
         recordSource: booking.recordSource || "client_booking",

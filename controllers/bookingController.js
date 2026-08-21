@@ -409,6 +409,7 @@ const archiveCurrentApprovedPayment = (booking, { approvedBy = null, source = "l
     });
     if (!alreadyArchived && (amount > 0 || referenceNumber || receiptNumber)) {
         booking.paymentTransactions.push({
+            paymentStage: booking.billingStage === "gate_in" ? "gate_in" : "gate_out",
             amount,
             subtotal: roundMoney(booking.billingSubtotal),
             isVatApplicable: booking.isVatApplicable !== false,
@@ -459,7 +460,7 @@ const resolveBillingStage = (booking = {}, requestedStage = "auto") => {
     return "gate_in";
 };
 const isLiftOnLiftOffRate = (rate = {}) => /^(LIFT_ON|LIFT_OFF)(?:_|$)/.test(String(rate.chargeCode || "").toUpperCase());
-const getLoloPaymentStage = (booking = {}) => booking.loloPaymentStage === "gate_out" ? "gate_out" : "gate_in";
+const getLoloPaymentStage = (booking = {}) => booking.loloPaymentStage === "gate_in" ? "gate_in" : "gate_out";
 const computeBookingBilling = async (booking, { asOf = new Date(), persist = false, useAsOfAsBillingEnd = false, phase = "auto" } = {}) => {
     const effectiveDate = new Date(asOf);
     const billingStage = resolveBillingStage(booking, phase);
@@ -473,7 +474,9 @@ const computeBookingBilling = async (booking, { asOf = new Date(), persist = fal
         ? getLoloPaymentStage(booking) === "gate_in"
             ? applicableRates.filter(isLiftOnLiftOffRate)
             : []
-        : applicableRates;
+        : getLoloPaymentStage(booking) === "gate_in"
+            ? applicableRates.filter((rate) => !isLiftOnLiftOffRate(rate))
+            : applicableRates;
     const matchedRates = getLatestRateByChargeCode(stagedRates);
     const storageDays = billingStage === "gate_out"
         ? getStorageDays(booking, effectiveDate, { useAsOfAsBillingEnd })
@@ -581,8 +584,10 @@ const refreshComputedBilling = async (booking) => {
     return booking;
 };
 const refreshComputedBillingList = async (bookings = []) => {
-    for (const booking of bookings) {
-        await refreshComputedBilling(booking);
+    const batchSize = 10;
+    for (let index = 0; index < bookings.length; index += batchSize) {
+        const batch = bookings.slice(index, index + batchSize);
+        await Promise.all(batch.map((booking) => refreshComputedBilling(booking)));
     }
     return bookings;
 };
@@ -730,6 +735,7 @@ const safeBooking = (booking) => {
         paymentApplicationStatus: doc.paymentApplicationStatus || "none",
         paymentTransactions: (doc.paymentTransactions || []).map((item) => ({
             id: String(item._id),
+            paymentStage: item.paymentStage === "gate_in" ? "gate_in" : "gate_out",
             amount: Number(item.amount) || 0,
             subtotal: Number(item.subtotal) || 0,
             isVatApplicable: item.isVatApplicable !== false,
@@ -1583,7 +1589,7 @@ const approveBooking = async (req, res) => {
     booking.assignedAt = new Date();
     booking.assignedBy = req.user._id;
     booking.storageStartDate = booking.storageStartDate || booking.inDate || booking.expectedArrivalDate || booking.approvedAt;
-    const requestedLoloPaymentStage = String(req.body.loloPaymentStage || booking.loloPaymentStage || "gate_in").trim().toLowerCase();
+    const requestedLoloPaymentStage = String(req.body.loloPaymentStage || "gate_out").trim().toLowerCase();
     if (!["gate_in", "gate_out"].includes(requestedLoloPaymentStage)) {
         return res.status(400).json({ success: false, message: "LOLO payment collection must be set to Gate-In or Gate-Out." });
     }
@@ -1649,7 +1655,9 @@ const approveBooking = async (req, res) => {
     (0, socket_js_1.emitToAdmins)("yard:slot_reserved", payload);
     (0, socket_js_1.emitToAdmins)("inventory:updated", payload);
     (0, socket_js_1.emitToUser)(booking.client?._id || booking.client, "booking:approved", payload);
-    await notifyClient(booking, "Booking approved and QR generated", "Your booking was approved. A booking number and QR value have been generated. Use the tracking page to view the latest status.", [
+    await notifyClient(booking, "Booking approved and QR generated", booking.loloPaymentStage === "gate_in"
+        ? "Your booking was approved. A booking number and QR value have been generated. Your Lift On / Lift Off payment must be completed at Gate-In before the container can proceed."
+        : "Your booking was approved. A booking number and QR value have been generated. Use the tracking page to view the latest status.", [
         { label: "Booking Number", value: booking.bookingNumber },
         { label: "Container", value: booking.containerNumber },
         { label: "Driver", value: booking.driverName },

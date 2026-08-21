@@ -58,6 +58,7 @@ const statusHistorySchema = new mongoose_1.default.Schema({
     changedAt: { type: Date, default: Date.now },
 }, { _id: false });
 const paymentTransactionSchema = new mongoose_1.default.Schema({
+    paymentStage: { type: String, enum: ["gate_in", "gate_out"], default: "gate_out", index: true },
     amount: { type: Number, default: 0, min: 0 },
     subtotal: { type: Number, default: 0, min: 0 },
     isVatApplicable: { type: Boolean, default: true },
@@ -178,7 +179,7 @@ const bookingSchema = new mongoose_1.default.Schema({
     loloPaymentStage: {
         type: String,
         enum: ["gate_in", "gate_out"],
-        default: "gate_in",
+        default: "gate_out",
         index: true,
     },
     billingStage: {
@@ -265,6 +266,9 @@ const bookingSchema = new mongoose_1.default.Schema({
 }, { timestamps: true });
 bookingSchema.index({ assignedBlock: 1, assignedBay: 1, assignedRow: 1, assignedTier: 1, status: 1 });
 bookingSchema.index({ containerNumber: 1, status: 1 });
+bookingSchema.index({ status: 1, billingStatus: 1, createdAt: -1 });
+bookingSchema.index({ client: 1, createdAt: -1 });
+bookingSchema.index({ inDate: 1, status: 1 });
 bookingSchema.pre("validate", function () {
     if (this.containerNumber) {
         this.containerNumber = String(this.containerNumber).toUpperCase().replace(/[^A-Z0-9]/g, "").trim();
@@ -273,7 +277,7 @@ bookingSchema.pre("validate", function () {
         this.actualContainerNumber = String(this.actualContainerNumber).toUpperCase().replace(/[^A-Z0-9]/g, "").trim();
     }
     this.rateType = this.rateType === "international" ? "international" : "local";
-    this.loloPaymentStage = this.loloPaymentStage === "gate_out" ? "gate_out" : "gate_in";
+    this.loloPaymentStage = this.loloPaymentStage === "gate_in" ? "gate_in" : "gate_out";
     this.assignedBay = Math.max(Number(this.assignedBay) || 1, 1);
     this.assignedRow = Math.max(Number(this.assignedRow) || 1, 1);
     this.assignedTier = Math.max(Number(this.assignedTier) || 1, 1);
