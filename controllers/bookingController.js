@@ -500,16 +500,41 @@ const toBillingLineItemSnapshot = (item = {}) => ({
 const getArchivedGateInBillingSnapshot = (booking = {}) => {
     if (getLoloPaymentStage(booking) !== "gate_in")
         return null;
+
     const transactions = Array.isArray(booking.paymentTransactions) ? [...booking.paymentTransactions] : [];
     transactions.sort((left, right) => new Date(left.approvedAt || left.archivedAt || left.paymentDate || 0).getTime() - new Date(right.approvedAt || right.archivedAt || right.paymentDate || 0).getTime());
+
+    // Only treat Gate-In LOLO as already paid when there is an approved
+    // payment transaction that actually covers the LOLO billing snapshot.
+    // This is important for legacy records created before LOLO was added:
+    // those records may have no Gate-In LOLO transaction at all, so their
+    // Gate-Out bill must include the missing Lift On / Lift Off charges.
     const gateInTransaction = transactions.find((transaction) => {
         const items = Array.isArray(transaction.lineItems) ? transaction.lineItems : [];
-        if (transaction.billingStage === "gate_in")
-            return items.some(isLiftOnLiftOffLineItem);
-        return items.length > 0 && items.every(isLiftOnLiftOffLineItem);
+        const isGateInLolo = transaction.billingStage === "gate_in"
+            ? items.some(isLiftOnLiftOffLineItem)
+            : items.length > 0 && items.every(isLiftOnLiftOffLineItem);
+
+        if (!isGateInLolo || !transaction.approvedAt)
+            return false;
+
+        const loloItems = items.filter(isLiftOnLiftOffLineItem);
+        const loloSubtotal = roundMoney(loloItems.reduce((sum, item) => sum + (Number(item.amount) || 0), 0));
+        const vatRate = transaction.isVatApplicable === false ? 0 : Math.max(Number(transaction.vatRate) || 0, 0);
+        const storedVat = roundMoney(transaction.vatAmount);
+        const loloVat = transaction.isVatApplicable === false
+            ? 0
+            : storedVat > 0
+                ? storedVat
+                : roundMoney(loloSubtotal * vatRate);
+        const loloGrossTotal = roundMoney(loloSubtotal + loloVat);
+
+        return Number(transaction.amount) + 0.005 >= loloGrossTotal;
     });
+
     if (!gateInTransaction)
         return null;
+
     const lineItems = (gateInTransaction.lineItems || []).filter(isLiftOnLiftOffLineItem).map(toBillingLineItemSnapshot);
     const subtotal = roundMoney(lineItems.reduce((sum, item) => sum + (Number(item.amount) || 0), 0));
     const transactionVatRate = gateInTransaction.isVatApplicable === false ? 0 : Math.max(Number(gateInTransaction.vatRate) || 0, 0);
