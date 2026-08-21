@@ -429,6 +429,9 @@ const archiveCurrentApprovedPayment = (booking, { approvedBy = null, source = "l
             receiptType: booking.receiptType || (booking.isVatApplicable === false ? "acknowledgement_receipt" : "official_receipt"),
             cashReceived: Number(booking.cashReceived) || 0,
             changeAmount: Number(booking.changeAmount) || 0,
+            appliedPaymentCredit: booking.billingStage === "gate_out" ? roundMoney(getApprovedPaymentAmount(booking)) : 0,
+            appliedGateInPaymentReferences: booking.billingStage === "gate_out" ? (booking.paymentTransactions || []).filter((item) => item.paymentStage === "gate_in").map((item) => String(item.referenceNumber || item.receiptNumber || "")).filter(Boolean) : [],
+            appliedGateInPaymentTransactionIds: booking.billingStage === "gate_out" ? (booking.paymentTransactions || []).filter((item) => item.paymentStage === "gate_in").map((item) => item._id).filter(Boolean) : [],
             source,
             archivedAt: new Date(),
         });
@@ -1404,8 +1407,7 @@ const resubmitClientBooking = async (req, res) => {
 };
 exports.resubmitClientBooking = resubmitClientBooking;
 const listClientBookings = async (req, res) => {
-    const bookings = await populateBooking(Booking_js_1.default.find({ client: req.user._id })).sort({ createdAt: -1 });
-    await refreshComputedBillingList(bookings);
+    const bookings = await populateBooking(Booking_js_1.default.find({ client: req.user._id })).sort({ createdAt: -1 }).limit(300).lean();
     return res.json({ success: true, bookings: bookings.map(safeBooking) });
 };
 exports.listClientBookings = listClientBookings;
@@ -1448,8 +1450,7 @@ const listAdminBookings = async (req, res) => {
             { shippingLine: { $regex: term, $options: "i" } },
         ];
     }
-    const bookings = await populateBooking(Booking_js_1.default.find(query)).sort({ createdAt: -1 }).limit(300);
-    await refreshComputedBillingList(bookings);
+    const bookings = await populateBooking(Booking_js_1.default.find(query)).sort({ createdAt: -1 }).limit(300).lean();
     return res.json({ success: true, bookings: bookings.map(safeBooking) });
 };
 exports.listAdminBookings = listAdminBookings;

@@ -610,14 +610,14 @@ const listInventoryContainers = async (req, res) => {
             .populate("preAdvice", "preAdviceNumber status")
             .populate("gateIn", "gateInNumber status completedAt")
             .sort({ status: 1, createdAt: -1 })
-            .limit(INVENTORY_QUERY_LIMIT),
+            .limit(INVENTORY_QUERY_LIMIT).lean(),
         Booking_js_1.default.find(bookingQuery)
             .populate("client", "name email companyName")
             .populate("assignedArea", "name code")
             .populate("assignedBlock", "name code")
             .populate("legacyRegisteredBy", "name")
             .sort({ gateInApprovedAt: -1, storedAt: -1, updatedAt: -1 })
-            .limit(INVENTORY_QUERY_LIMIT),
+            .limit(INVENTORY_QUERY_LIMIT).lean(),
     ]);
     const combined = [...bookingContainers.map(safeBookingContainer), ...containers.map((container) => ({ ...safeContainer(container), source: "pre_advice" }))].sort((a, b) => {
         const aWaitingStorage = a.source === "booking" && a.bookingStatus === "gate_in_approved" ? 0 : 1;

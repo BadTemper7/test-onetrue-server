@@ -79,6 +79,9 @@ const paymentTransactionSchema = new mongoose_1.default.Schema({
     cashReceived: { type: Number, default: 0, min: 0 },
     changeAmount: { type: Number, default: 0, min: 0 },
     source: { type: String, enum: ["online", "cash", "legacy"], default: "online" },
+    appliedPaymentCredit: { type: Number, default: 0, min: 0 },
+    appliedGateInPaymentReferences: { type: [String], default: [] },
+    appliedGateInPaymentTransactionIds: { type: [mongoose_1.default.Schema.Types.ObjectId], default: [] },
     archivedAt: { type: Date, default: Date.now },
 }, { _id: true });
 const bookingSchema = new mongoose_1.default.Schema({
@@ -269,6 +272,9 @@ bookingSchema.index({ containerNumber: 1, status: 1 });
 bookingSchema.index({ status: 1, billingStatus: 1, createdAt: -1 });
 bookingSchema.index({ client: 1, createdAt: -1 });
 bookingSchema.index({ inDate: 1, status: 1 });
+bookingSchema.index({ status: 1, gateInApprovedAt: -1, storedAt: -1, updatedAt: -1 });
+bookingSchema.index({ status: 1, outDate: 1, updatedAt: -1 });
+bookingSchema.index({ client: 1, status: 1, createdAt: -1 });
 bookingSchema.pre("validate", function () {
     if (this.containerNumber) {
         this.containerNumber = String(this.containerNumber).toUpperCase().replace(/[^A-Z0-9]/g, "").trim();
