@@ -367,6 +367,20 @@ const getGateInPaymentTotal = (booking = {}) => {
 const getGateOutPaymentTotal = (booking = {}) => {
     return roundMoney((booking.paymentTransactions || []).filter((item) => item.paymentStage === "gate_out").reduce((sum, item) => sum + (Number(item.amount) || 0), 0));
 };
+const applyGateOutPaymentBalance = (booking, grossTotal) => {
+    const total = roundMoney(grossTotal);
+    const paid = getGateOutPaymentTotal(booking);
+    const balanceDue = roundMoney(Math.max(total - paid, 0));
+    booking.paymentCreditAmount = 0;
+    booking.paymentBalanceDue = balanceDue;
+    booking.paymentAmount = balanceDue;
+    booking.paymentApplicationStatus = paid <= 0
+        ? "none"
+        : balanceDue > 0
+            ? "partial_payment"
+            : "fully_applied";
+    return { paid, balanceDue };
+};
 const getApprovedPaymentAmount = (booking = {}) => {
     const storedAmount = Math.max(Number(booking.approvedPaymentAmount) || 0, 0);
     if (storedAmount > 0)
@@ -435,9 +449,9 @@ const archiveCurrentApprovedPayment = (booking, { approvedBy = null, source = "l
             receiptType: booking.receiptType || (booking.isVatApplicable === false ? "acknowledgement_receipt" : "official_receipt"),
             cashReceived: Number(booking.cashReceived) || 0,
             changeAmount: Number(booking.changeAmount) || 0,
-            appliedPaymentCredit: booking.billingStage === "gate_out" ? getGateInPaymentTotal(booking) : 0,
-            appliedGateInPaymentReferences: booking.billingStage === "gate_out" ? (booking.paymentTransactions || []).filter((item) => item.paymentStage === "gate_in").map((item) => String(item.referenceNumber || item.receiptNumber || "")).filter(Boolean) : [],
-            appliedGateInPaymentTransactionIds: booking.billingStage === "gate_out" ? (booking.paymentTransactions || []).filter((item) => item.paymentStage === "gate_in").map((item) => item._id).filter(Boolean) : [],
+            appliedPaymentCredit: 0,
+            appliedGateInPaymentReferences: [],
+            appliedGateInPaymentTransactionIds: [],
             source,
             archivedAt: new Date(),
         });
@@ -571,9 +585,7 @@ const computeBookingBilling = async (booking, { asOf = new Date(), persist = fal
         // LOLO payment must never be deducted from the Gate-Out transaction
         // because that payment is not part of the Gate-Out breakdown.
         if (billingStage === "gate_out") {
-            booking.paymentCreditAmount = 0;
-            booking.paymentBalanceDue = total;
-            booking.paymentAmount = total;
+            applyGateOutPaymentBalance(booking, total);
         } else {
             applyApprovedPaymentCredit(booking, total);
         }
@@ -637,6 +649,21 @@ const populateBooking = (query) => {
         .populate("overstayFeeWaivedBy", "name")
         .populate("legacyRegisteredBy", "name");
 };
+const getGateInBillingTotal = (booking = {}) => {
+    const gateInTransactions = (booking.paymentTransactions || []).filter((item) => item.paymentStage === "gate_in");
+    if (gateInTransactions.length > 0) {
+        return roundMoney(Math.max(...gateInTransactions.map((item) => Number(item.grossTotal) || Number(item.amount) || 0), 0));
+    }
+    return 0;
+};
+const getGateOutBillingTotal = (booking = {}) => {
+    const gateOutTransactions = (booking.paymentTransactions || []).filter((item) => item.paymentStage === "gate_out");
+    if (gateOutTransactions.length > 0) {
+        return roundMoney(Math.max(Number(booking.billingTotal) || 0, ...gateOutTransactions.map((item) => Number(item.grossTotal) || 0), 0));
+    }
+    return roundMoney(Number(booking.billingTotal) || 0);
+};
+
 const safeBooking = (booking) => {
     const doc = booking.toObject ? booking.toObject() : booking;
     const client = doc.client || {};
@@ -652,8 +679,10 @@ const safeBooking = (booking) => {
     const gateOutSchedule = getGateOutScheduleInfo(doc);
     const gateInPaymentTotal = getGateInPaymentTotal(doc);
     const gateOutPaymentTotal = getGateOutPaymentTotal(doc);
-    const gateOutBillingTotal = Number(doc.billingTotal) || 0;
-    const totalBillingAmount = roundMoney(gateInPaymentTotal + gateOutBillingTotal);
+    const gateInBillingTotal = getGateInBillingTotal(doc);
+    const gateOutBillingTotal = getGateOutBillingTotal(doc);
+    const totalBillingAmount = roundMoney(gateInBillingTotal + gateOutBillingTotal);
+    const totalPaidAmount = roundMoney(gateInPaymentTotal + gateOutPaymentTotal);
     return {
         id: String(doc._id),
         client: client?._id ? String(client._id) : doc.client ? String(doc.client) : "",
@@ -746,8 +775,10 @@ const safeBooking = (booking) => {
         billingTotal: Number(doc.billingTotal) || 0,
         gateInPaymentTotal,
         gateOutPaymentTotal,
+        gateInBillingTotal,
         gateOutBillingTotal,
         totalBillingAmount,
+        totalPaidAmount,
         billingDays: Number(doc.billingDays) || 0,
         billingComputedAt: doc.billingComputedAt,
         billingPreviousTotal: Number(doc.billingPreviousTotal) || 0,
@@ -2179,9 +2210,8 @@ const submitBookingPayment = async (req, res) => {
     if (billingResult.total <= 0) {
         return res.status(400).json({ success: false, message: "Computed billing amount is zero. Please ask admin to review the rate setup." });
     }
-    const gateInPaymentTotal = paymentStage === "gate_out" ? getGateInPaymentTotal(booking) : 0;
     const paymentBalanceDue = paymentStage === "gate_out"
-        ? roundMoney(Math.max(billingResult.total - gateInPaymentTotal, 0))
+        ? roundMoney(billingResult.total)
         : applyApprovedPaymentCredit(booking, billingResult.total).balanceDue;
     if (paymentBalanceDue <= 0) {
         booking.billingStatus = "paid_approved";
@@ -2242,7 +2272,7 @@ const submitBookingPayment = async (req, res) => {
     addHistory(booking, {
         billingStatus: "payment_under_review",
         remarks: paymentStage === "gate_out"
-            ? `${stageLabel} payment proof submitted by client for PHP ${paymentBalanceDue.toLocaleString()}. Gate-Out gross bill PHP ${billingResult.total.toLocaleString()}. Gate-In LOLO payment remains a separate transaction and is not deducted.`
+            ? `${stageLabel} payment proof submitted by client for PHP ${paymentBalanceDue.toLocaleString()}. Gate-Out gross bill PHP ${billingResult.total.toLocaleString()}. Gate-In LOLO payment remains a separate Gate-In transaction and is not part of the Gate-Out bill.`
             : `${stageLabel} payment proof submitted by client for PHP ${paymentBalanceDue.toLocaleString()}. Gross bill PHP ${billingResult.total.toLocaleString()} with Gate-In payment credit applied.`,
         changedBy: req.user._id,
     });
@@ -2287,12 +2317,11 @@ const recordAdminCashPayment = async (req, res) => {
         if (!gateOutBilling.hasMatchedRates || gateOutBilling.total <= 0) {
             return res.status(400).json({ success: false, message: "Complete Gate-Out Rate Setup before recording the payment." });
         }
-        const gateInPaymentTotal = getGateInPaymentTotal(booking);
-        const gateOutNetBalance = roundMoney(Math.max(gateOutBilling.total - gateInPaymentTotal, 0));
-        booking.paymentCreditAmount = 0;
-        booking.paymentBalanceDue = gateOutNetBalance;
-        booking.paymentAmount = gateOutNetBalance;
-        booking.billingStatus = gateOutNetBalance > 0 ? "unpaid" : "paid_approved";
+        // Gate-Out is a separate transaction. Gate-In LOLO payments are never
+        // applied as credit against the Gate-Out bill. The Gate-Out balance
+        // is always the full Gate-Out transaction total.
+        const gateOutBalance = applyGateOutPaymentBalance(booking, gateOutBilling.total).balanceDue;
+        booking.billingStatus = gateOutBalance > 0 ? "unpaid" : "paid_approved";
         await booking.save();
     }
     if (booking.billingStatus === "paid_approved" && Number(booking.paymentBalanceDue || 0) <= 0) {
@@ -2357,9 +2386,8 @@ const recordAdminCashPayment = async (req, res) => {
             ? "Configure active Lift On / Lift Off rates before recording Gate-In cash payment."
             : "Complete Rate Setup before recording the cash payment." });
     }
-    const gateInPaymentTotal = paymentStage === "gate_out" ? getGateInPaymentTotal(booking) : 0;
     const paymentBalanceDue = paymentStage === "gate_out"
-        ? roundMoney(Math.max(billingResult.total - gateInPaymentTotal, 0))
+        ? roundMoney(billingResult.total)
         : applyApprovedPaymentCredit(booking, billingResult.total).balanceDue;
     if (paymentBalanceDue <= 0) {
         booking.billingStatus = "paid_approved";
@@ -2756,12 +2784,12 @@ const approveGateOutReversal = async (req, res) => {
     booking.gateOutReversalAdminRemarks = String(req.body.remarks || "").trim().slice(0, 500);
     booking.gateOutReversalCount = Number(booking.gateOutReversalCount || 0) + 1;
     const billingResult = await (0, exports.computeBookingBilling)(booking, { asOf: new Date(), persist: true });
-    const creditResult = applyApprovedPaymentCredit(booking, billingResult.total);
-    booking.billingStatus = creditResult.balanceDue <= 0 ? "paid_approved" : "unpaid";
+    const creditResult = applyGateOutPaymentBalance(booking, billingResult.total);
+    booking.billingStatus = creditResult.balanceDue <= 0 ? "paid_approved" : creditResult.paid > 0 ? "additional_payment_required" : "unpaid";
     addHistory(booking, {
         status: "stored_in_assigned_area",
         billingStatus: booking.billingStatus,
-        remarks: `Gate-Out reversal approved. Container returned to storage. Approved payment credit PHP ${creditResult.approvedAmount.toLocaleString()} preserved; current gross bill PHP ${billingResult.total.toLocaleString()}; balance due PHP ${creditResult.balanceDue.toLocaleString()}.${booking.gateOutReversalAdminRemarks ? ` Admin remarks: ${booking.gateOutReversalAdminRemarks}` : ""}`,
+        remarks: `Gate-Out reversal approved. Container returned to storage. Previously collected Gate-Out payment PHP ${creditResult.paid.toLocaleString()} preserved; current gross bill PHP ${billingResult.total.toLocaleString()}; balance due PHP ${creditResult.balanceDue.toLocaleString()}.${booking.gateOutReversalAdminRemarks ? ` Admin remarks: ${booking.gateOutReversalAdminRemarks}` : ""}`,
         changedBy: req.user._id,
     });
     await booking.save();
@@ -2775,7 +2803,7 @@ const approveGateOutReversal = async (req, res) => {
     (0, socket_js_1.emitToUser)(booking.client?._id || booking.client, "booking:gate_out_reversal_approved", payload);
     await notifyClient(booking, "Gate-Out reversal approved", "The incorrect Gate-Out was cancelled and your container was returned to storage. Storage billing has resumed and the approved payment remains available as credit for this booking.", [
         { label: "Container", value: booking.containerNumber },
-        { label: "Approved Payment Credit", value: `PHP ${creditResult.approvedAmount.toLocaleString()}` },
+        { label: "Gate-Out Payment Already Collected", value: `PHP ${creditResult.paid.toLocaleString()}` },
         { label: "Current Balance Due", value: `PHP ${creditResult.balanceDue.toLocaleString()}` },
         { label: "Assigned Slot", value: booking.assignedSlotNumber || "Retained" },
     ], { notificationType: "gate_out_reversal_approved" });
@@ -2866,7 +2894,7 @@ const updateGateOutRequestDates = async (req, res) => {
     if (!billingResult.hasMatchedRates || billingResult.total <= 0) {
         return res.status(400).json({ success: false, message: "No active billing rate matched the corrected dates. Review Rate Setup before saving." });
     }
-    const creditResult = applyApprovedPaymentCredit(booking, billingResult.total);
+    const creditResult = applyGateOutPaymentBalance(booking, billingResult.total);
     booking.billingPreviousTotal = previousTotal;
     booking.billingRecomputedAt = new Date();
     booking.billingRecomputedBy = req.user._id;
@@ -2874,7 +2902,7 @@ const updateGateOutRequestDates = async (req, res) => {
     booking.billingRecomputeCount = Number(booking.billingRecomputeCount || 0) + 1;
     booking.billingStatus = creditResult.balanceDue <= 0
         ? "paid_approved"
-        : creditResult.approvedAmount > 0
+        : creditResult.paid > 0
             ? "additional_payment_required"
             : "unpaid";
     addHistory(booking, {
@@ -2932,7 +2960,7 @@ const setBookingOverstayFeePolicy = async (req, res) => {
         useAsOfAsBillingEnd: !waive && schedule.isOverstaying,
         phase: "gate_out",
     });
-    const creditResult = applyApprovedPaymentCredit(booking, billingResult.total);
+    const creditResult = applyGateOutPaymentBalance(booking, billingResult.total);
     booking.billingPreviousTotal = previousTotal;
     booking.billingRecomputedAt = serverTime;
     booking.billingRecomputedBy = req.user._id;
@@ -2942,7 +2970,7 @@ const setBookingOverstayFeePolicy = async (req, res) => {
     booking.gateOutOverstayStartedAt = schedule.overstayStartedAt;
     booking.billingStatus = creditResult.balanceDue <= 0
         ? "paid_approved"
-        : creditResult.approvedAmount > 0
+        : creditResult.paid > 0
             ? "additional_payment_required"
             : "unpaid";
     addHistory(booking, {
@@ -3054,7 +3082,7 @@ const recomputeGateOutBilling = async (req, res) => {
     }
     const previousTotal = roundMoney(booking.billingTotal);
     const billingResult = await (0, exports.computeBookingBilling)(booking, { asOf: serverTime, persist: true, useAsOfAsBillingEnd: true, phase: "gate_out" });
-    const creditResult = applyApprovedPaymentCredit(booking, billingResult.total);
+    const creditResult = applyGateOutPaymentBalance(booking, billingResult.total);
     booking.billingPreviousTotal = previousTotal;
     booking.billingRecomputedAt = serverTime;
     booking.billingRecomputedBy = req.user._id;
@@ -3065,7 +3093,7 @@ const recomputeGateOutBilling = async (req, res) => {
     booking.billingStatus = creditResult.balanceDue > 0 ? "additional_payment_required" : "paid_approved";
     addHistory(booking, {
         billingStatus: booking.billingStatus,
-        remarks: `Overstay billing recomputed using server time ${serverTime.toLocaleString()}. Previous gross bill PHP ${previousTotal.toLocaleString()}, recomputed gross bill PHP ${billingResult.total.toLocaleString()}, approved payment credit PHP ${creditResult.approvedAmount.toLocaleString()}, balance due PHP ${creditResult.balanceDue.toLocaleString()}.`,
+        remarks: `Overstay billing recomputed using server time ${serverTime.toLocaleString()}. Previous gross bill PHP ${previousTotal.toLocaleString()}, recomputed gross bill PHP ${billingResult.total.toLocaleString()}, Gate-Out payment already collected PHP ${creditResult.paid.toLocaleString()}, balance due PHP ${creditResult.balanceDue.toLocaleString()}.`,
         changedBy: req.user._id,
     });
     await booking.save();
@@ -3082,14 +3110,14 @@ const recomputeGateOutBilling = async (req, res) => {
         { label: "Container", value: booking.containerNumber },
         { label: "Recomputed As Of", value: serverTime.toLocaleString() },
         { label: "Updated Gross Bill", value: `PHP ${billingResult.total.toLocaleString()}` },
-        { label: "Approved Payment Credit", value: `PHP ${creditResult.approvedAmount.toLocaleString()}` },
+        { label: "Gate-Out Payment Already Collected", value: `PHP ${creditResult.paid.toLocaleString()}` },
         { label: "Additional Balance Due", value: `PHP ${creditResult.balanceDue.toLocaleString()}` },
     ], { notificationType: "overstay_billing_recomputed" });
     return res.json({
         success: true,
         message: creditResult.balanceDue > 0
             ? `Overstay billing recomputed. An additional PHP ${creditResult.balanceDue.toLocaleString()} must be paid and approved before release.`
-            : "Overstay billing recomputed. Approved payment credit still covers the updated total.",
+            : "Overstay billing recomputed. Previously collected Gate-Out payment still covers the updated total.",
         booking: payload,
         preview: await buildGateOutBillingPreview(booking, serverTime),
     });
@@ -3114,7 +3142,7 @@ const completeBookingGateOut = async (req, res) => {
             useAsOfAsBillingEnd: !booking.overstayFeeWaived,
             phase: "gate_out",
         });
-        const releaseCredit = applyApprovedPaymentCredit(booking, releaseBilling.total);
+        const releaseCredit = applyGateOutPaymentBalance(booking, releaseBilling.total);
         const finalBillingBasisLabel = booking.overstayFeeWaived
             ? "the scheduled Gate-Out time because the overstay fee is waived"
             : "the actual server release time";
@@ -3130,7 +3158,7 @@ const completeBookingGateOut = async (req, res) => {
         if (releaseCredit.balanceDue > 0) {
             addHistory(booking, {
                 billingStatus: "additional_payment_required",
-                remarks: `Release paused after final billing was recomputed using ${booking.overstayFeeWaived ? `the scheduled Gate-Out time ${finalBillingAsOf.toLocaleString()} because the overstay fee is waived` : `the actual server release time ${finalBillingAsOf.toLocaleString()}`}. Previous gross bill PHP ${previousTotal.toLocaleString()}, updated gross bill PHP ${releaseBilling.total.toLocaleString()}, approved payment credit PHP ${releaseCredit.approvedAmount.toLocaleString()}, balance due PHP ${releaseCredit.balanceDue.toLocaleString()}.`,
+                remarks: `Release paused after final billing was recomputed using ${booking.overstayFeeWaived ? `the scheduled Gate-Out time ${finalBillingAsOf.toLocaleString()} because the overstay fee is waived` : `the actual server release time ${finalBillingAsOf.toLocaleString()}`}. Previous gross bill PHP ${previousTotal.toLocaleString()}, updated gross bill PHP ${releaseBilling.total.toLocaleString()}, Gate-Out payment already collected PHP ${releaseCredit.paid.toLocaleString()}, balance due PHP ${releaseCredit.balanceDue.toLocaleString()}.`,
                 changedBy: req.user._id,
             });
             await booking.save();
@@ -3145,7 +3173,7 @@ const completeBookingGateOut = async (req, res) => {
                 { label: "Container", value: booking.containerNumber },
                 { label: "Final Billing As Of", value: finalBillingAsOf.toLocaleString() },
                 { label: "Updated Gross Bill", value: `PHP ${releaseBilling.total.toLocaleString()}` },
-                { label: "Approved Payment Credit", value: `PHP ${releaseCredit.approvedAmount.toLocaleString()}` },
+                { label: "Gate-Out Payment Already Collected", value: `PHP ${releaseCredit.paid.toLocaleString()}` },
                 { label: "Additional Balance Due", value: `PHP ${releaseCredit.balanceDue.toLocaleString()}` },
             ], { notificationType: "additional_payment_required" });
             return res.status(403).json({
@@ -3207,7 +3235,13 @@ const completeBookingGateOut = async (req, res) => {
             billingSubtotal: booking.billingSubtotal || billingResult.subtotal || 0,
             vatRate: Number.isFinite(Number(booking.vatRate)) ? Number(booking.vatRate) : billingResult.vatRate,
             vatAmount: booking.vatAmount || billingResult.vatAmount || 0,
-            revenueTotal: roundMoney(getGateInPaymentTotal(booking) + (booking.billingTotal || billingResult.total || 0)),
+            gateInBillingTotal: getGateInBillingTotal(booking),
+            gateInPaymentTotal: getGateInPaymentTotal(booking),
+            gateOutBillingTotal: Number(booking.billingTotal || billingResult.total) || 0,
+            gateOutPaymentTotal: getGateOutPaymentTotal(booking),
+            totalBillingAmount: roundMoney(getGateInBillingTotal(booking) + (Number(booking.billingTotal || billingResult.total) || 0)),
+            totalPaidAmount: roundMoney(getGateInPaymentTotal(booking) + getGateOutPaymentTotal(booking)),
+            revenueTotal: roundMoney(getGateInBillingTotal(booking) + (Number(booking.billingTotal || billingResult.total) || 0)),
             paymentReferenceNumber: booking.paymentReferenceNumber || "",
             paymentDate: booking.paymentDate || booking.paymentReviewedAt || booking.paymentSubmittedAt || null,
             paymentStatus: booking.billingStatus,

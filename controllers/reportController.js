@@ -186,6 +186,15 @@ const getDashboardTrend = ({ range, bookings, releaseReports, totalYardCapacity 
 };
 const safeReleaseReport = (report) => {
     const client = report.client || {};
+    const booking = report.booking || {};
+    const transactions = Array.isArray(booking.paymentTransactions) ? booking.paymentTransactions : [];
+    const gateInPaymentTotal = roundMoney(Number(report.gateInPaymentTotal) || transactions.filter((item) => item.paymentStage === "gate_in").reduce((sum, item) => sum + (Number(item.amount) || 0), 0));
+    const gateOutPaymentTotal = roundMoney(Number(report.gateOutPaymentTotal) || transactions.filter((item) => item.paymentStage === "gate_out").reduce((sum, item) => sum + (Number(item.amount) || 0), 0));
+    const gateInBillingTransactions = transactions.filter((item) => item.paymentStage === "gate_in");
+    const gateInBillingTotal = roundMoney(Number(report.gateInBillingTotal) || Math.max(...gateInBillingTransactions.map((item) => Number(item.grossTotal) || Number(item.amount) || 0), 0));
+    const gateOutBillingTotal = roundMoney(Number(report.gateOutBillingTotal) || Number(booking.billingTotal) || Number(report.revenueTotal || 0) - gateInBillingTotal);
+    const totalBillingAmount = roundMoney(Number(report.totalBillingAmount) || gateInBillingTotal + gateOutBillingTotal);
+    const totalPaidAmount = roundMoney(Number(report.totalPaidAmount) || gateInPaymentTotal + gateOutPaymentTotal);
     return {
         id: String(report._id),
         reportNumber: report.reportNumber,
@@ -205,6 +214,12 @@ const safeReleaseReport = (report) => {
         billingDays: Number(report.billingDays) || 0,
         billingSubtotal: roundMoney(report.billingSubtotal),
         vatAmount: roundMoney(report.vatAmount),
+        gateInBillingTotal,
+        gateInPaymentTotal,
+        gateOutBillingTotal,
+        gateOutPaymentTotal,
+        totalBillingAmount,
+        totalPaidAmount,
         revenueTotal: roundMoney(report.revenueTotal),
         paymentReferenceNumber: report.paymentReferenceNumber || "",
         generatedAt: report.generatedAt,
@@ -264,6 +279,7 @@ const getYardContainerReport = async (req, res) => {
             .lean(),
         ReleaseReport_js_1.default.find(releaseQuery)
             .populate("client", "name companyName email")
+            .populate("booking", "paymentTransactions billingTotal billingLineItems")
             .sort({ releasedAt: -1, generatedAt: -1 })
             .limit(1000)
             .lean(),
