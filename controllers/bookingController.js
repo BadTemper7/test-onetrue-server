@@ -361,6 +361,12 @@ const shouldApplyBillingRate = (rate, booking) => {
     return true;
 };
 const roundMoney = (value) => Math.round((Number(value) || 0) * 100) / 100;
+const getGateInPaymentTotal = (booking = {}) => {
+    return roundMoney((booking.paymentTransactions || []).filter((item) => item.paymentStage === "gate_in").reduce((sum, item) => sum + (Number(item.amount) || 0), 0));
+};
+const getGateOutPaymentTotal = (booking = {}) => {
+    return roundMoney((booking.paymentTransactions || []).filter((item) => item.paymentStage === "gate_out").reduce((sum, item) => sum + (Number(item.amount) || 0), 0));
+};
 const getApprovedPaymentAmount = (booking = {}) => {
     const storedAmount = Math.max(Number(booking.approvedPaymentAmount) || 0, 0);
     if (storedAmount > 0)
@@ -429,7 +435,7 @@ const archiveCurrentApprovedPayment = (booking, { approvedBy = null, source = "l
             receiptType: booking.receiptType || (booking.isVatApplicable === false ? "acknowledgement_receipt" : "official_receipt"),
             cashReceived: Number(booking.cashReceived) || 0,
             changeAmount: Number(booking.changeAmount) || 0,
-            appliedPaymentCredit: booking.billingStage === "gate_out" ? roundMoney(getApprovedPaymentAmount(booking)) : 0,
+            appliedPaymentCredit: booking.billingStage === "gate_out" ? getGateInPaymentTotal(booking) : 0,
             appliedGateInPaymentReferences: booking.billingStage === "gate_out" ? (booking.paymentTransactions || []).filter((item) => item.paymentStage === "gate_in").map((item) => String(item.referenceNumber || item.receiptNumber || "")).filter(Boolean) : [],
             appliedGateInPaymentTransactionIds: booking.billingStage === "gate_out" ? (booking.paymentTransactions || []).filter((item) => item.paymentStage === "gate_in").map((item) => item._id).filter(Boolean) : [],
             source,
@@ -644,6 +650,10 @@ const safeBooking = (booking) => {
     const overstayFeeWaivedBy = doc.overstayFeeWaivedBy || null;
     const legacyRegisteredBy = doc.legacyRegisteredBy || null;
     const gateOutSchedule = getGateOutScheduleInfo(doc);
+    const gateInPaymentTotal = getGateInPaymentTotal(doc);
+    const gateOutPaymentTotal = getGateOutPaymentTotal(doc);
+    const gateOutBillingTotal = Number(doc.billingTotal) || 0;
+    const totalBillingAmount = roundMoney(gateInPaymentTotal + gateOutBillingTotal);
     return {
         id: String(doc._id),
         client: client?._id ? String(client._id) : doc.client ? String(doc.client) : "",
@@ -734,6 +744,10 @@ const safeBooking = (booking) => {
         vatRate: Number.isFinite(Number(doc.vatRate)) ? Number(doc.vatRate) : 0.12,
         vatAmount: Number(doc.vatAmount) || 0,
         billingTotal: Number(doc.billingTotal) || 0,
+        gateInPaymentTotal,
+        gateOutPaymentTotal,
+        gateOutBillingTotal,
+        totalBillingAmount,
         billingDays: Number(doc.billingDays) || 0,
         billingComputedAt: doc.billingComputedAt,
         billingPreviousTotal: Number(doc.billingPreviousTotal) || 0,
@@ -2165,8 +2179,9 @@ const submitBookingPayment = async (req, res) => {
     if (billingResult.total <= 0) {
         return res.status(400).json({ success: false, message: "Computed billing amount is zero. Please ask admin to review the rate setup." });
     }
+    const gateInPaymentTotal = paymentStage === "gate_out" ? getGateInPaymentTotal(booking) : 0;
     const paymentBalanceDue = paymentStage === "gate_out"
-        ? roundMoney(billingResult.total)
+        ? roundMoney(Math.max(billingResult.total - gateInPaymentTotal, 0))
         : applyApprovedPaymentCredit(booking, billingResult.total).balanceDue;
     if (paymentBalanceDue <= 0) {
         booking.billingStatus = "paid_approved";
@@ -2272,10 +2287,12 @@ const recordAdminCashPayment = async (req, res) => {
         if (!gateOutBilling.hasMatchedRates || gateOutBilling.total <= 0) {
             return res.status(400).json({ success: false, message: "Complete Gate-Out Rate Setup before recording the payment." });
         }
+        const gateInPaymentTotal = getGateInPaymentTotal(booking);
+        const gateOutNetBalance = roundMoney(Math.max(gateOutBilling.total - gateInPaymentTotal, 0));
         booking.paymentCreditAmount = 0;
-        booking.paymentBalanceDue = roundMoney(gateOutBilling.total);
-        booking.paymentAmount = roundMoney(gateOutBilling.total);
-        booking.billingStatus = "unpaid";
+        booking.paymentBalanceDue = gateOutNetBalance;
+        booking.paymentAmount = gateOutNetBalance;
+        booking.billingStatus = gateOutNetBalance > 0 ? "unpaid" : "paid_approved";
         await booking.save();
     }
     if (booking.billingStatus === "paid_approved" && Number(booking.paymentBalanceDue || 0) <= 0) {
@@ -2340,8 +2357,9 @@ const recordAdminCashPayment = async (req, res) => {
             ? "Configure active Lift On / Lift Off rates before recording Gate-In cash payment."
             : "Complete Rate Setup before recording the cash payment." });
     }
+    const gateInPaymentTotal = paymentStage === "gate_out" ? getGateInPaymentTotal(booking) : 0;
     const paymentBalanceDue = paymentStage === "gate_out"
-        ? roundMoney(billingResult.total)
+        ? roundMoney(Math.max(billingResult.total - gateInPaymentTotal, 0))
         : applyApprovedPaymentCredit(booking, billingResult.total).balanceDue;
     if (paymentBalanceDue <= 0) {
         booking.billingStatus = "paid_approved";
@@ -3189,7 +3207,7 @@ const completeBookingGateOut = async (req, res) => {
             billingSubtotal: booking.billingSubtotal || billingResult.subtotal || 0,
             vatRate: Number.isFinite(Number(booking.vatRate)) ? Number(booking.vatRate) : billingResult.vatRate,
             vatAmount: booking.vatAmount || billingResult.vatAmount || 0,
-            revenueTotal: booking.billingTotal || billingResult.total || 0,
+            revenueTotal: roundMoney(getGateInPaymentTotal(booking) + (booking.billingTotal || billingResult.total || 0)),
             paymentReferenceNumber: booking.paymentReferenceNumber || "",
             paymentDate: booking.paymentDate || booking.paymentReviewedAt || booking.paymentSubmittedAt || null,
             paymentStatus: booking.billingStatus,
