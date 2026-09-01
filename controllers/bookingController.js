@@ -392,6 +392,29 @@ const getGateInPaymentTotal = (booking = {}) => {
 const getGateOutPaymentTotal = (booking = {}) => {
     return roundMoney((booking.paymentTransactions || []).filter((item) => item.paymentStage === "gate_out").reduce((sum, item) => sum + (Number(item.amount) || 0), 0));
 };
+const getLatestGateOutPaymentTransaction = (booking = {}) => {
+    const transactions = (booking.paymentTransactions || []).filter((item) => item.paymentStage === "gate_out");
+    return transactions.length ? transactions[transactions.length - 1] : null;
+};
+const restoreApprovedGateOutBillingSnapshot = (booking) => {
+    const latestPayment = getLatestGateOutPaymentTransaction(booking);
+    const paid = getGateOutPaymentTotal(booking);
+    if (latestPayment && Number(latestPayment.grossTotal || 0) > 0) {
+        booking.billingStage = "gate_out";
+        booking.billingLineItems = (latestPayment.lineItems || []).map((item) => item.toObject ? item.toObject() : { ...item });
+        booking.billingSubtotal = roundMoney(latestPayment.subtotal);
+        booking.isVatApplicable = latestPayment.isVatApplicable !== false;
+        booking.vatRate = Number(latestPayment.vatRate) || 0;
+        booking.vatAmount = roundMoney(latestPayment.vatAmount);
+        booking.billingTotal = roundMoney(latestPayment.grossTotal);
+    }
+    booking.paymentCreditAmount = roundMoney(Math.max(paid - Number(booking.billingTotal || 0), 0));
+    booking.paymentBalanceDue = 0;
+    booking.paymentAmount = 0;
+    booking.paymentApplicationStatus = "fully_applied";
+    booking.billingStatus = "paid_approved";
+    return { paid, lockedGrossTotal: roundMoney(booking.billingTotal), latestPayment };
+};
 const applyGateOutPaymentBalance = (booking, grossTotal) => {
     const total = roundMoney(grossTotal);
     const paid = getGateOutPaymentTotal(booking);
@@ -3348,55 +3371,20 @@ const completeBookingGateOut = async (req, res) => {
         return res.status(400).json({ success: false, message: "Only approved gate-out bookings can be completed." });
     }
     if (booking.status === "gate_out_approved") {
-        const actualReleaseTime = new Date();
-        const finalBillingAsOf = booking.overstayFeeWaived && booking.outDate
-            ? parseBookingDate(booking.outDate) || actualReleaseTime
-            : actualReleaseTime;
-        const previousTotal = roundMoney(booking.billingTotal);
-        const releaseBilling = await (0, exports.computeBookingBilling)(booking, {
-            asOf: finalBillingAsOf,
-            persist: true,
-            useAsOfAsBillingEnd: !booking.overstayFeeWaived,
-            phase: "gate_out",
-        });
-        const releaseCredit = applyGateOutPaymentBalance(booking, releaseBilling.total);
-        const finalBillingBasisLabel = booking.overstayFeeWaived
-            ? "the scheduled Gate-Out time because the overstay fee is waived"
-            : "the actual server release time";
-        booking.billingPreviousTotal = previousTotal;
-        booking.billingRecomputedAt = finalBillingAsOf;
-        booking.billingRecomputedBy = req.user._id;
-        booking.billingRecomputeReason = booking.overstayFeeWaived ? "Final billing at scheduled Gate-Out (overstay fee waived)" : "Final billing at physical release";
-        booking.billingRecomputeCount = Number(booking.billingRecomputeCount || 0) + 1;
-        const releaseSchedule = getGateOutScheduleInfo(booking, actualReleaseTime);
+        // Gate-Out payment is finalized before Gate-Out approval. Release Container
+        // must use that approved payment snapshot and must never create a second
+        // payment requirement simply because the physical release happens later.
+        const previousBillingStatus = booking.billingStatus;
+        const previousBalanceDue = Number(booking.paymentBalanceDue || 0);
+        const paymentLock = restoreApprovedGateOutBillingSnapshot(booking);
+        const releaseSchedule = getGateOutScheduleInfo(booking, new Date());
         booking.gateOutScheduleStatus = releaseSchedule.status;
         booking.gateOutOverstayStartedAt = releaseSchedule.overstayStartedAt;
-        booking.billingStatus = releaseCredit.balanceDue <= 0 ? "paid_approved" : "additional_payment_required";
-        if (releaseCredit.balanceDue > 0) {
+        if (previousBillingStatus !== "paid_approved" || previousBalanceDue > 0) {
             addHistory(booking, {
-                billingStatus: "additional_payment_required",
-                remarks: `Release paused after final billing was recomputed using ${booking.overstayFeeWaived ? `the scheduled Gate-Out time ${finalBillingAsOf.toLocaleString()} because the overstay fee is waived` : `the actual server release time ${finalBillingAsOf.toLocaleString()}`}. Previous gross bill PHP ${previousTotal.toLocaleString()}, updated gross bill PHP ${releaseBilling.total.toLocaleString()}, Gate-Out payment already collected PHP ${releaseCredit.paid.toLocaleString()}, balance due PHP ${releaseCredit.balanceDue.toLocaleString()}.`,
+                billingStatus: "paid_approved",
+                remarks: `Release payment lock restored from the approved Gate-Out transaction. No additional release payment was requested. Approved Gate-Out payment PHP ${paymentLock.paid.toLocaleString()}, locked gross bill PHP ${paymentLock.lockedGrossTotal.toLocaleString()}.`,
                 changedBy: req.user._id,
-            });
-            await booking.save();
-            await booking.populate("client", "name email companyName phoneNumber");
-            await booking.populate("assignedArea", "name code isCongestionArea");
-            await booking.populate("assignedBlock", "name code");
-            await booking.populate("billingRecomputedBy", "name");
-            const blockedReleasePayload = safeBooking(booking);
-            (0, socket_js_1.emitToAdmins)("booking:overstay_billing_recomputed", blockedReleasePayload);
-            (0, socket_js_1.emitToUser)(booking.client?._id || booking.client, "booking:overstay_billing_recomputed", blockedReleasePayload);
-            await notifyClient(booking, "Additional payment required before release", `Final billing was recalculated using ${finalBillingBasisLabel}. An additional balance must be paid and approved before the container can physically exit the yard.`, [
-                { label: "Container", value: booking.containerNumber },
-                { label: "Final Billing As Of", value: finalBillingAsOf.toLocaleString() },
-                { label: "Updated Gross Bill", value: `PHP ${releaseBilling.total.toLocaleString()}` },
-                { label: "Gate-Out Payment Already Collected", value: `PHP ${releaseCredit.paid.toLocaleString()}` },
-                { label: "Additional Balance Due", value: `PHP ${releaseCredit.balanceDue.toLocaleString()}` },
-            ], { notificationType: "additional_payment_required" });
-            return res.status(403).json({
-                success: false,
-                message: `Final billing changed using ${finalBillingBasisLabel}. Release cannot be completed until the additional PHP ${releaseCredit.balanceDue.toLocaleString()} is paid and approved.`,
-                booking: blockedReleasePayload,
             });
         }
     }

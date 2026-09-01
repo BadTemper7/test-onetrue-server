@@ -211,7 +211,7 @@ const bookingSchema = new mongoose_1.default.Schema({
     paymentBalanceDue: { type: Number, default: 0 },
     paymentApplicationStatus: {
         type: String,
-        enum: ["none", "fully_applied", "partial_credit", "credit_available"],
+        enum: ["none", "fully_applied", "partial_payment", "partial_credit", "credit_available"],
         default: "none",
     },
     paymentTransactions: { type: [paymentTransactionSchema], default: [] },
