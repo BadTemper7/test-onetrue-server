@@ -67,6 +67,7 @@ router.patch("/bookings/:id/relocate", (0, authMiddleware_js_1.requirePermission
 router.post("/bookings/:id/payment/cash", (0, authMiddleware_js_1.requireAnyPermission)([["gateIn", "edit"], ["gateOut", "edit"]]), (0, asyncHandler_js_1.default)(bookingController_js_1.recordAdminCashPayment));
 router.patch("/bookings/:id/payment/approve", (0, authMiddleware_js_1.requirePermission)("paymentVerification", "edit"), (0, asyncHandler_js_1.default)(bookingController_js_1.approveBookingPayment));
 router.patch("/bookings/:id/payment/reject", (0, authMiddleware_js_1.requirePermission)("paymentVerification", "edit"), (0, asyncHandler_js_1.default)(bookingController_js_1.rejectBookingPayment));
+router.patch("/bookings/:id/payments/:transactionId/amount", authMiddleware_js_1.superAdminOnly, (0, asyncHandler_js_1.default)(bookingController_js_1.updateApprovedPaymentAmount));
 router.patch("/bookings/:id/cancel", (0, authMiddleware_js_1.requirePermission)("operations", "edit"), (0, asyncHandler_js_1.default)(bookingController_js_1.cancelBooking));
 router.patch("/bookings/:id/gate-out/approve", (0, authMiddleware_js_1.requirePermission)("gateOut", "edit"), (0, asyncHandler_js_1.default)(bookingController_js_1.approveBookingGateOut));
 router.patch("/bookings/:id/gate-out/reject", (0, authMiddleware_js_1.requirePermission)("gateOut", "edit"), (0, asyncHandler_js_1.default)(bookingController_js_1.rejectBookingGateOut));
