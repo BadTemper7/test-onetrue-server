@@ -237,6 +237,9 @@ const safeBookingContainer = (booking) => {
         hauler: doc.hauler || "",
         gateInConditions: doc.gateInConditions || [],
         gateInConditionOther: doc.gateInConditionOther || "",
+        gateOutConditions: doc.gateOutConditions || [],
+        gateOutConditionOther: doc.gateOutConditionOther || "",
+        gateOutRequestRemarks: doc.gateOutRequestRemarks || "",
         billingSubtotal: Number(doc.billingSubtotal) || 0,
         vatAmount: Number(doc.vatAmount) || 0,
         billingTotal: Number(doc.billingTotal) || 0,
@@ -590,6 +593,7 @@ const INVENTORY_BOOKING_SELECT = [
     "assignedSlotNumber", "gateInApprovedAt", "storedAt", "storageStartDate", "inDate", "expectedArrivalDate", "outDate", "releasedAt",
     "gateOutGracePeriodMinutes", "gateOutScheduleStatus", "gateOutOverstayStartedAt", "physicalCondition", "truckPlateNumber", "driverName",
     "inspectionRemarks", "documents", "sealNumber", "sealIntact", "driverLicenseNumber", "hauler", "gateInConditions", "gateInConditionOther",
+    "gateOutConditions", "gateOutConditionOther", "gateOutRequestRemarks",
     "billingSubtotal", "vatAmount", "billingTotal", "paymentBalanceDue", "paymentAmount", "assignedAt", "createdAt", "updatedAt",
 ].join(" ");
 const getInventoryQueryLimit = (value) => {
