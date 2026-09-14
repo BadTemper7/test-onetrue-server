@@ -724,15 +724,18 @@ const listInventoryContainers = async (req, res) => {
     const visibleLimit = requestedLimit - 1;
     const limited = combined.slice(0, visibleLimit);
     const stats = statsRows[0] || { totalContainers: 0, waitingStorage: 0, inventoryTeu: 0, inventoryFeu: 0 };
-    return res.json({
-        success: true,
-        containers: limited,
-        stats: {
+    const statsPayload = includeStats
+        ? {
             totalContainers: Number(stats.totalContainers) || 0,
             waitingStorage: Number(stats.waitingStorage) || 0,
             inventoryTeu: Number(stats.inventoryTeu) || 0,
             inventoryFeu: Number(stats.inventoryFeu) || 0,
-        },
+        }
+        : undefined;
+    return res.json({
+        success: true,
+        containers: limited,
+        stats: statsPayload,
         limit: visibleLimit,
         returned: limited.length,
         truncated: combined.length > visibleLimit || containers.length >= requestedLimit || bookingContainers.length >= requestedLimit,

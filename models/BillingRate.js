@@ -57,7 +57,11 @@ billingRateSchema.pre("validate", function () {
     this.billingScope = ["base", "storage", "optional_stripping_stuffing", "display_only"].includes(this.billingScope) ? this.billingScope : "base";
     this.containerSize = String(this.containerSize || "all");
     this.containerType = String(this.containerType || "all");
-    this.loadStatus = String(this.loadStatus || "all");
+    this.loadStatus = String(this.loadStatus || "all").trim().toLowerCase();
+    if (this.loadStatus === "loaded")
+        this.loadStatus = "laden";
+    if (!["all", "empty", "laden"].includes(this.loadStatus))
+        this.loadStatus = "all";
     const defaultUnitLabels = {
         per_container: "per container",
         per_teu: "per 20 ft equivalent",

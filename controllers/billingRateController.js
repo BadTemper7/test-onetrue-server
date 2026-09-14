@@ -11,6 +11,26 @@ const toNumber = (value, fallback = 0) => {
     return Number.isFinite(parsed) ? parsed : fallback;
 };
 const normalizeRateType = (value) => String(value || "").toLowerCase() === "international" ? "international" : "local";
+const normalizeLoadStatus = (value) => {
+    const normalized = String(value || "all").trim().toLowerCase();
+    if (normalized === "loaded")
+        return "laden";
+    return ["all", "empty", "laden"].includes(normalized) ? normalized : "all";
+};
+const getChargeType = (rate = {}) => {
+    const text = `${rate.chargeCode || ""} ${rate.description || ""}`.trim().toLowerCase();
+    if (/lift[_\s-]*(on|in)/.test(text))
+        return "lift_on";
+    if (/lift[_\s-]*(off|out)/.test(text))
+        return "lift_off";
+    if (/storage/.test(text))
+        return "storage";
+    if (/total[_\s-]*handling/.test(text))
+        return "total_handling";
+    if (/congestion/.test(text))
+        return "congestion";
+    return "other";
+};
 const isDocumentationRate = (rate = {}) => /documentation|document_fee|doc_fee/.test(`${rate.description || ""} ${rate.chargeCode || ""}`.toLowerCase());
 exports.OTLI_REFERENCE_RATES = [
     {
@@ -93,12 +113,15 @@ const getDefaultUnitLabel = (unit = "per_container", containerSize = "all") => {
         return "fixed charge";
     return containerSize === "all" ? "per container" : `per ${containerSize} ft container`;
 };
-const inferRateRules = ({ description = "", unitLabel = "", requestedUnit = "", currentRate = null } = {}) => {
+const inferRateRules = ({ description = "", unitLabel = "", requestedUnit = "", requestedContainerSize = "", currentRate = null } = {}) => {
     const descriptionText = String(description).trim().toLowerCase();
     const unitText = String(unitLabel).trim().toLowerCase();
     const combined = `${descriptionText} ${unitText}`;
     const sizeMatch = combined.match(/(?:^|\D)(20|40)(?:\D|$)/);
-    let containerSize = sizeMatch?.[1] || currentRate?.containerSize || "all";
+    const normalizedRequestedSize = ["20", "40", "all"].includes(String(requestedContainerSize || "").trim())
+        ? String(requestedContainerSize || "").trim()
+        : "";
+    let containerSize = normalizedRequestedSize || sizeMatch?.[1] || currentRate?.containerSize || "all";
     const isLiftIn = /\blift\s*(in|on)\b/.test(descriptionText);
     const isLiftOut = /\blift\s*(out|off)\b/.test(descriptionText);
     const isLift = isLiftIn || isLiftOut;
@@ -183,7 +206,7 @@ const buildRatePayload = (body = {}, currentRate = null) => {
     const unitLabel = String(body.unitLabel
         ?? currentRate?.unitLabel
         ?? getDefaultUnitLabel(requestedUnit || currentRate?.unit, currentRate?.containerSize)).trim();
-    const rules = inferRateRules({ description, unitLabel, requestedUnit, currentRate });
+    const rules = inferRateRules({ description, unitLabel, requestedUnit, requestedContainerSize: body.containerSize, currentRate });
     const { suggestedChargeCode, requiresContainerSize, ...normalizedRules } = rules;
     return normalizeRatePayload({
         description,
@@ -192,9 +215,7 @@ const buildRatePayload = (body = {}, currentRate = null) => {
         unitLabel,
         ...normalizedRules,
         containerType: body.containerType ?? currentRate?.containerType ?? normalizedRules.containerType ?? "all",
-        loadStatus: ["all", "empty", "laden"].includes(String(body.loadStatus ?? currentRate?.loadStatus ?? "all").toLowerCase())
-            ? String(body.loadStatus ?? currentRate?.loadStatus ?? "all").toLowerCase()
-            : "all",
+        loadStatus: normalizeLoadStatus(body.loadStatus ?? currentRate?.loadStatus ?? "all"),
         rateAmount: body.rateAmount ?? currentRate?.rateAmount ?? 0,
         freeDays: body.freeDays ?? currentRate?.freeDays ?? 0,
         minimumAmount: body.minimumAmount ?? currentRate?.minimumAmount ?? 0,
@@ -219,7 +240,8 @@ const safeRate = (rate) => {
         unitLabel: doc.unitLabel || getDefaultUnitLabel(doc.unit, doc.containerSize),
         containerSize: doc.containerSize,
         containerType: doc.containerType,
-        loadStatus: doc.loadStatus,
+        loadStatus: normalizeLoadStatus(doc.loadStatus),
+        chargeType: getChargeType(doc),
         rateAmount: Number(doc.rateAmount) || 0,
         freeDays: Number(doc.freeDays) || 0,
         minimumAmount: Number(doc.minimumAmount) || 0,
@@ -244,7 +266,7 @@ const normalizeRatePayload = (body = {}) => ({
     unitLabel: String(body.unitLabel || getDefaultUnitLabel(body.unit || (body.billingScope === "storage" ? "storage_day" : "per_container"), String(body.containerSize || "all"))).trim(),
     containerSize: String(body.containerSize || "all"),
     containerType: body.containerType || "all",
-    loadStatus: body.loadStatus || "all",
+    loadStatus: normalizeLoadStatus(body.loadStatus),
     rateAmount: toNumber(body.rateAmount, 0),
     freeDays: toNumber(body.freeDays, 0),
     minimumAmount: toNumber(body.minimumAmount, 0),
@@ -261,7 +283,7 @@ const getRateConfigKey = (rate = {}) => [
     String(rate.chargeCode || rate.description || rate._id || ""),
     String(rate.containerSize || "all"),
     String(rate.containerType || "all"),
-    String(rate.loadStatus || "all"),
+    normalizeLoadStatus(rate.loadStatus),
 ].join(":");
 const addEffectiveWindowFilter = (query, asOf = new Date()) => {
     query.effectiveDate = { $lte: asOf };
@@ -277,7 +299,7 @@ const validateConfiguredRate = (payload) => {
     if (needsSize && !["20", "40"].includes(String(payload.containerSize))) {
         return "Select a 20ft or 40ft unit for this billing rate.";
     }
-    if (!["all", "empty", "laden"].includes(String(payload.loadStatus || "all"))) {
+    if (!["all", "empty", "laden"].includes(normalizeLoadStatus(payload.loadStatus))) {
         return "Container load status must be All, Empty, or Loaded.";
     }
     if (/congestion/.test(description) && payload.billingScope !== "display_only") {
@@ -321,7 +343,7 @@ const listBillingRates = async (req, res) => {
     if (rateType && rateType !== "all")
         query.rateType = normalizeRateType(rateType);
     if (loadStatus && loadStatus !== "all")
-        query.loadStatus = loadStatus === "loaded" ? "laden" : loadStatus;
+        query.loadStatus = normalizeLoadStatus(loadStatus);
     if (search) {
         const term = String(search).trim();
         query.$or = [
@@ -439,7 +461,7 @@ const seedReferenceBillingRates = async (req, res) => {
             effectiveTo: null,
             status: "active",
             containerType: "all",
-            loadStatus: "all",
+            loadStatus: normalizeLoadStatus(template.loadStatus || "all"),
             freeDays: 0,
             minimumAmount: 0,
         });
@@ -515,7 +537,7 @@ const listActiveBillingRates = async (req, res) => {
         query.rateType = normalizeRateType(req.query.rateType);
     }
     if (req.query.loadStatus && req.query.loadStatus !== "all") {
-        query.loadStatus = req.query.loadStatus === "loaded" ? "laden" : req.query.loadStatus;
+        query.loadStatus = normalizeLoadStatus(req.query.loadStatus);
     }
     addEffectiveWindowFilter(query, now);
     const rates = await BillingRate_js_1.default.find(query)
