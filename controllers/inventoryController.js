@@ -300,7 +300,7 @@ const listInventoryClients = async (req, res) => {
     const clients = await User_js_1.default.find({
         userType: "client",
         status: { $in: ["verified", "active"] },
-    }).select("name companyName email phoneNumber status").sort({ companyName: 1, name: 1 }).limit(500);
+    }).select("name companyName email phoneNumber status").sort({ companyName: 1, name: 1 }).limit(500).lean();
     return res.json({
         success: true,
         clients: clients.map((client) => ({
@@ -577,53 +577,142 @@ const createLegacyInventoryContainer = async (req, res) => {
     });
 };
 exports.createLegacyInventoryContainer = createLegacyInventoryContainer;
-const INVENTORY_LIST_LIMIT = 1000;
-const INVENTORY_QUERY_LIMIT = INVENTORY_LIST_LIMIT + 1;
+const INVENTORY_LIST_LIMIT = 500;
+const INVENTORY_BOOKING_STATUSES = ["gate_in_approved", "stored_in_assigned_area", "gate_out_requested", "gate_out_approved", "gate_out_reversal_requested"];
+const INVENTORY_STORAGE_BOOKING_STATUSES = ["stored_in_assigned_area", "gate_out_requested", "gate_out_approved", "gate_out_reversal_requested"];
+const INVENTORY_LEGACY_STATUSES = ["awaiting_yard_assignment", "in_yard", "for_billing", "pending_payment", "payment_verified", "cleared_for_gate_out", "released", "hold"];
+const INVENTORY_STORAGE_LEGACY_STATUSES = ["in_yard", "for_billing", "pending_payment", "payment_verified", "cleared_for_gate_out", "hold"];
+const INVENTORY_BOOKING_SELECT = [
+    "recordSource", "legacyRegistrationNumber", "legacyRegisteredAt", "legacyRegisteredBy", "legacyRegistrationReason",
+    "historicalGateInDateType", "historicalSourceReference", "billingStartMethod", "migrationDate", "openingBalanceAmount", "openingCreditAmount",
+    "bookingReference", "client", "containerNumber", "containerSize", "containerType", "containerLoadStatus", "rateType", "shippingLine",
+    "bookingNumber", "blNumber", "status", "billingStatus", "assignedArea", "assignedBlock", "assignedBay", "assignedRow", "assignedTier",
+    "assignedSlotNumber", "gateInApprovedAt", "storedAt", "storageStartDate", "inDate", "expectedArrivalDate", "outDate", "releasedAt",
+    "gateOutGracePeriodMinutes", "gateOutScheduleStatus", "gateOutOverstayStartedAt", "physicalCondition", "truckPlateNumber", "driverName",
+    "inspectionRemarks", "documents", "sealNumber", "sealIntact", "driverLicenseNumber", "hauler", "gateInConditions", "gateInConditionOther",
+    "billingSubtotal", "vatAmount", "billingTotal", "paymentBalanceDue", "paymentAmount", "assignedAt", "createdAt", "updatedAt",
+].join(" ");
+const getInventoryQueryLimit = (value) => {
+    const requested = Math.floor(Number(value) || INVENTORY_LIST_LIMIT);
+    return Math.min(Math.max(requested, 25), INVENTORY_LIST_LIMIT) + 1;
+};
 const listInventoryContainers = async (req, res) => {
-    const { areaId, status, clientId, search } = req.query;
-    const query = {};
-    const bookingQuery = { status: { $in: ["gate_in_approved", "stored_in_assigned_area", "gate_out_requested", "gate_out_approved", "gate_out_reversal_requested"] } };
+    const { areaId, blockId, status, clientId, search, loadStatus, rateType, recordSource, source = "all", view = "inventory" } = req.query;
+    const isStorageView = String(view).toLowerCase() === "storage";
+    const query = { status: { $in: isStorageView ? INVENTORY_STORAGE_LEGACY_STATUSES : INVENTORY_LEGACY_STATUSES } };
+    const bookingQuery = { status: { $in: isStorageView ? INVENTORY_STORAGE_BOOKING_STATUSES : INVENTORY_BOOKING_STATUSES } };
+    const inventoryStatsQuery = { status: { $in: INVENTORY_BOOKING_STATUSES } };
+    const normalizedSource = ["all", "booking", "legacy"].includes(String(source)) ? String(source) : "all";
+    const normalizedLoadStatus = String(loadStatus || "").toLowerCase() === "loaded" ? "laden" : String(loadStatus || "").toLowerCase();
+    const requestedLimit = getInventoryQueryLimit(req.query.limit);
+
     if (clientId && clientId !== "all") {
         query.client = clientId;
         bookingQuery.client = clientId;
+        inventoryStatsQuery.client = Booking_js_1.default.schema.path("client").cast(clientId);
     }
-    if (status && status !== "all")
-        query.status = status;
+    if (status && status !== "all") {
+        if (INVENTORY_LEGACY_STATUSES.includes(status))
+            query.status = status;
+        if (INVENTORY_BOOKING_STATUSES.includes(status))
+            bookingQuery.status = status;
+    }
     if (areaId) {
-        query.$or = [{ area: areaId }, { area: null }];
-        bookingQuery.$or = [{ assignedArea: areaId }, { assignedArea: null }];
+        query.area = areaId;
+        bookingQuery.assignedArea = areaId;
+    }
+    if (blockId) {
+        query.block = blockId;
+        bookingQuery.assignedBlock = blockId;
+    }
+    if (["empty", "laden"].includes(normalizedLoadStatus)) {
+        query.containerStatus = normalizedLoadStatus;
+        bookingQuery.containerLoadStatus = normalizedLoadStatus;
+    }
+    if (["local", "international"].includes(String(rateType || "").toLowerCase())) {
+        query.rateType = String(rateType).toLowerCase();
+        bookingQuery.rateType = String(rateType).toLowerCase();
+    }
+    if (recordSource && recordSource !== "all") {
+        bookingQuery.recordSource = recordSource;
     }
     if (search) {
-        const term = String(search).trim();
-        query.containerNumber = { $regex: term, $options: "i" };
-        bookingQuery.$and = [
-            ...(bookingQuery.$and || []),
-            {
-                $or: [
-                    { containerNumber: { $regex: term, $options: "i" } },
-                    { bookingReference: { $regex: term, $options: "i" } },
-                ],
-            },
+        const escaped = String(search).trim().replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+        const pattern = new RegExp(escaped, "i");
+        const [matchingClients, matchingAreas] = await Promise.all([
+            User_js_1.default.find({
+                userType: "client",
+                $or: [{ name: pattern }, { companyName: pattern }, { email: pattern }],
+            }).select("_id").limit(100).lean(),
+            YardArea_js_1.default.find({ $or: [{ name: pattern }, { code: pattern }] }).select("_id").limit(100).lean(),
+        ]);
+        const clientIds = matchingClients.map((item) => item._id);
+        const areaIds = matchingAreas.map((item) => item._id);
+        query.$or = [
+            { containerNumber: pattern },
+            { bookingNumber: pattern },
+            { blNumber: pattern },
+            { slotNumber: pattern },
+            { shippingLine: pattern },
+            ...(clientIds.length ? [{ client: { $in: clientIds } }] : []),
+            ...(areaIds.length ? [{ area: { $in: areaIds } }] : []),
+        ];
+        bookingQuery.$or = [
+            { containerNumber: pattern },
+            { bookingReference: pattern },
+            { bookingNumber: pattern },
+            { blNumber: pattern },
+            { legacyRegistrationNumber: pattern },
+            { assignedSlotNumber: pattern },
+            { shippingLine: pattern },
+            ...(clientIds.length ? [{ client: { $in: clientIds } }] : []),
+            ...(areaIds.length ? [{ assignedArea: { $in: areaIds } }] : []),
         ];
     }
-    const [containers, bookingContainers] = await Promise.all([
-        InventoryContainer_js_1.default.find(query)
+
+    const legacyPromise = normalizedSource === "booking"
+        ? Promise.resolve([])
+        : InventoryContainer_js_1.default.find(query)
             .populate("client", "name email companyName")
             .populate("area", "name code")
             .populate("block", "name code")
             .populate("preAdvice", "preAdviceNumber status")
             .populate("gateIn", "gateInNumber status completedAt")
             .sort({ status: 1, createdAt: -1 })
-            .limit(INVENTORY_QUERY_LIMIT).lean(),
-        Booking_js_1.default.find(bookingQuery)
+            .limit(requestedLimit)
+            .lean();
+    const bookingPromise = normalizedSource === "legacy"
+        ? Promise.resolve([])
+        : Booking_js_1.default.find(bookingQuery)
+            .select(INVENTORY_BOOKING_SELECT)
             .populate("client", "name email companyName")
             .populate("assignedArea", "name code")
             .populate("assignedBlock", "name code")
             .populate("legacyRegisteredBy", "name")
             .sort({ gateInApprovedAt: -1, storedAt: -1, updatedAt: -1 })
-            .limit(INVENTORY_QUERY_LIMIT).lean(),
-    ]);
-    const combined = [...bookingContainers.map(safeBookingContainer), ...containers.map((container) => ({ ...safeContainer(container), source: "pre_advice" }))].sort((a, b) => {
+            .limit(requestedLimit)
+            .lean();
+    const includeStats = String(req.query.includeStats || "true").toLowerCase() !== "false";
+    const statsPromise = normalizedSource === "legacy" || !includeStats
+        ? Promise.resolve([])
+        : Booking_js_1.default.aggregate([
+            { $match: inventoryStatsQuery },
+            {
+                $group: {
+                    _id: null,
+                    totalContainers: { $sum: 1 },
+                    waitingStorage: { $sum: { $cond: [{ $eq: ["$status", "gate_in_approved"] }, 1, 0] } },
+                    inventoryTeu: { $sum: { $cond: [{ $eq: ["$containerSize", 40] }, 2, 1] } },
+                    inventoryFeu: { $sum: { $cond: [{ $eq: ["$containerSize", 40] }, 1, 0.5] } },
+                },
+            },
+        ]);
+
+    const [containers, bookingContainers, statsRows] = await Promise.all([legacyPromise, bookingPromise, statsPromise]);
+    const combined = [
+        ...bookingContainers.map(safeBookingContainer),
+        ...containers.map((container) => ({ ...safeContainer(container), source: "pre_advice" })),
+    ].sort((a, b) => {
         const aWaitingStorage = a.source === "booking" && a.bookingStatus === "gate_in_approved" ? 0 : 1;
         const bWaitingStorage = b.source === "booking" && b.bookingStatus === "gate_in_approved" ? 0 : 1;
         if (aWaitingStorage !== bWaitingStorage)
@@ -632,13 +721,22 @@ const listInventoryContainers = async (req, res) => {
         const aEnteredAt = new Date(a.inventoryEnteredAt || a.gateInApprovedAt || a.storedAt || a.createdAt || 0).getTime();
         return bEnteredAt - aEnteredAt;
     });
-    const limited = combined.slice(0, INVENTORY_LIST_LIMIT);
+    const visibleLimit = requestedLimit - 1;
+    const limited = combined.slice(0, visibleLimit);
+    const stats = statsRows[0] || { totalContainers: 0, waitingStorage: 0, inventoryTeu: 0, inventoryFeu: 0 };
     return res.json({
         success: true,
         containers: limited,
-        limit: INVENTORY_LIST_LIMIT,
+        stats: {
+            totalContainers: Number(stats.totalContainers) || 0,
+            waitingStorage: Number(stats.waitingStorage) || 0,
+            inventoryTeu: Number(stats.inventoryTeu) || 0,
+            inventoryFeu: Number(stats.inventoryFeu) || 0,
+        },
+        limit: visibleLimit,
         returned: limited.length,
-        truncated: combined.length > INVENTORY_LIST_LIMIT,
+        truncated: combined.length > visibleLimit || containers.length >= requestedLimit || bookingContainers.length >= requestedLimit,
+        source: normalizedSource,
     });
 };
 exports.listInventoryContainers = listInventoryContainers;

@@ -28,6 +28,9 @@ const billingLineItemSchema = new mongoose_1.default.Schema({
     category: { type: String, default: "", trim: true },
     billingScope: { type: String, default: "", trim: true },
     rateType: { type: String, enum: ["local", "international"], default: "local" },
+    rateLoadStatus: { type: String, enum: ["all", "empty", "laden"], default: "all" },
+    rateEffectiveDate: { type: Date, default: null },
+    rateVersion: { type: Number, default: 1 },
     amount: { type: Number, default: 0 },
 }, { _id: false });
 const additionalChargeSchema = new mongoose_1.default.Schema({
@@ -200,6 +203,8 @@ const bookingSchema = new mongoose_1.default.Schema({
     billingTotal: { type: Number, default: 0 },
     billingDays: { type: Number, default: 0 },
     billingComputedAt: { type: Date, default: null },
+    gateInRateEffectiveAt: { type: Date, default: null, index: true },
+    gateOutRateEffectiveAt: { type: Date, default: null, index: true },
     billingPreviousTotal: { type: Number, default: 0 },
     billingRecomputedAt: { type: Date, default: null },
     billingRecomputedBy: { type: mongoose_1.default.Schema.Types.ObjectId, ref: "User", default: null },
@@ -275,6 +280,8 @@ bookingSchema.index({ inDate: 1, status: 1 });
 bookingSchema.index({ status: 1, gateInApprovedAt: -1, storedAt: -1, updatedAt: -1 });
 bookingSchema.index({ status: 1, outDate: 1, updatedAt: -1 });
 bookingSchema.index({ client: 1, status: 1, createdAt: -1 });
+bookingSchema.index({ status: 1, containerLoadStatus: 1, rateType: 1, gateInApprovedAt: -1 });
+bookingSchema.index({ recordSource: 1, status: 1, updatedAt: -1 });
 bookingSchema.pre("validate", function () {
     if (this.containerNumber) {
         this.containerNumber = String(this.containerNumber).toUpperCase().replace(/[^A-Z0-9]/g, "").trim();
