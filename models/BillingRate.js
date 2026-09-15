@@ -49,7 +49,6 @@ const billingRateSchema = new mongoose_1.default.Schema({
 billingRateSchema.index({ rateType: 1, chargeCode: 1, containerSize: 1, containerType: 1, loadStatus: 1, effectiveDate: -1 });
 billingRateSchema.index({ status: 1, effectiveDate: 1, effectiveTo: 1 });
 billingRateSchema.index({ status: 1, rateType: 1, category: 1, billingScope: 1, containerSize: 1, containerType: 1, loadStatus: 1, effectiveDate: -1 });
-billingRateSchema.index({ rateType: 1, billingScope: 1, effectiveDate: 1, effectiveTo: 1 });
 billingRateSchema.pre("validate", function () {
     this.description = String(this.description || "").trim();
     this.chargeCode = String(this.chargeCode || this.description || "").toUpperCase().replace(/[^A-Z0-9]+/g, "_").replace(/^_+|_+$/g, "");
