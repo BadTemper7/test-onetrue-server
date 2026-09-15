@@ -443,7 +443,7 @@ const updateBillingRate = async (req, res) => {
     (0, socket_js_1.emitToAdmins)("billing_rate:updated", { ...safe, previousRateId: String(currentRate._id), versioned: true });
     return res.json({
         success: true,
-        message: "Billing rate updated as a new version. Previous transactions remain on their original rate snapshot.",
+        message: "Billing rate updated as a new version. Previous payment transactions keep their original rate snapshot, while ongoing storage is billed by each rate version's effective date.",
         rate: safe,
         previousRateId: String(currentRate._id),
     });
@@ -502,7 +502,7 @@ const seedReferenceBillingRates = async (req, res) => {
     (0, socket_js_1.emitToAdmins)("billing_rate:reference_applied", { count: rates.length, effectiveDate });
     return res.json({
         success: true,
-        message: "OTLI reference rates have been applied to Rate Setup without overwriting historical rate versions.",
+        message: "OTLI reference rates have been applied without overwriting historical versions. Ongoing storage will use the applicable rate for each effective-date period.",
         rates: rates.map(safeRate),
     });
 };

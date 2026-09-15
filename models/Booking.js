@@ -31,6 +31,9 @@ const billingLineItemSchema = new mongoose_1.default.Schema({
     rateLoadStatus: { type: String, enum: ["all", "empty", "laden"], default: "all" },
     rateEffectiveDate: { type: Date, default: null },
     rateVersion: { type: Number, default: 1 },
+    ratePeriodStart: { type: Date, default: null },
+    ratePeriodEnd: { type: Date, default: null },
+    ratePeriodLabel: { type: String, default: "", trim: true },
     amount: { type: Number, default: 0 },
 }, { _id: false });
 const additionalChargeSchema = new mongoose_1.default.Schema({

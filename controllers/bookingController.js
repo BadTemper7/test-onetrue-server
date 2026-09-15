@@ -218,7 +218,7 @@ const getGateOutScheduleInfo = (booking = {}, asOf = new Date()) => {
         serverTime,
     };
 };
-const getStorageDays = (booking, asOf = new Date(), { useAsOfAsBillingEnd = false } = {}) => {
+const getStorageBillingRange = (booking, asOf = new Date(), { useAsOfAsBillingEnd = false } = {}) => {
     const effectiveAsOf = parseBookingDate(asOf) || new Date();
     const { inDate, outDate } = resolveBookingDateRange(booking);
     const start = inDate || booking.storageStartDate || booking.storedAt || booking.gateInApprovedAt || booking.createdAt || effectiveAsOf;
@@ -231,7 +231,12 @@ const getStorageDays = (booking, asOf = new Date(), { useAsOfAsBillingEnd = fals
     else if (approvedAndInsideYard && (!outDate || effectiveAsOf.getTime() > outDate.getTime())) {
         billingEnd = effectiveAsOf;
     }
-    return (0, billingDays_js_1.getCalendarBillingDays)(start, billingEnd) || 1;
+    const startDate = parseBookingDate(start) || effectiveAsOf;
+    const endDate = parseBookingDate(billingEnd) || effectiveAsOf;
+    const startDay = (0, billingDays_js_1.getCalendarDayNumber)(startDate);
+    const endDay = (0, billingDays_js_1.getCalendarDayNumber)(endDate);
+    const days = (0, billingDays_js_1.getCalendarBillingDays)(startDate, endDate) || 1;
+    return { startDate, endDate, startDay, endDay, days };
 };
 const validateBookingDateRange = ({ inDate, outDate, expectedArrivalDate }) => {
     const parsedIn = parseBookingDate(inDate || expectedArrivalDate);
@@ -552,10 +557,104 @@ const resolveBillingStage = (booking = {}, requestedStage = "auto") => {
     return "gate_in";
 };
 const isLiftOnLiftOffRate = (rate = {}) => /^(LIFT_ON|LIFT_OFF)(?:_|$)/.test(String(rate.chargeCode || "").toUpperCase());
+const isStorageRate = (rate = {}) => {
+    const unit = String(rate.unit || "").toLowerCase();
+    const scope = String(rate.billingScope || "").toLowerCase();
+    const rateText = `${rate.chargeCode || ""} ${rate.description || ""}`.toLowerCase();
+    return scope === "storage" || ["storage_day", "per_day"].includes(unit) || /(?:^|_)storage(?:_|$)|\bstorage\b/.test(rateText);
+};
+const STORAGE_DAY_MS = 24 * 60 * 60 * 1000;
+const storagePeriodFormatter = new Intl.DateTimeFormat("en-PH", {
+    timeZone: billingDays_js_1.DEFAULT_BILLING_TIME_ZONE || "Asia/Manila",
+    month: "short",
+    day: "2-digit",
+    year: "numeric",
+});
+const calendarDayNumberToDate = (dayNumber) => Number.isFinite(dayNumber)
+    ? new Date(dayNumber * STORAGE_DAY_MS)
+    : null;
+const formatStoragePeriodLabel = (startDay, endDay) => {
+    const startDate = calendarDayNumberToDate(startDay);
+    const endDate = calendarDayNumberToDate(endDay);
+    if (!startDate || !endDate)
+        return "";
+    const startLabel = storagePeriodFormatter.format(startDate);
+    const endLabel = storagePeriodFormatter.format(endDate);
+    return startDay === endDay ? startLabel : `${startLabel} - ${endLabel}`;
+};
+const rateIsEffectiveOnCalendarDay = (rate, dayNumber) => {
+    if (!Number.isFinite(dayNumber))
+        return false;
+    const effectiveDay = (0, billingDays_js_1.getCalendarDayNumber)(rate.effectiveDate || rate.createdAt);
+    if (effectiveDay === null || effectiveDay > dayNumber)
+        return false;
+    const effectiveToDay = rate.effectiveTo
+        ? (0, billingDays_js_1.getCalendarDayNumber)(rate.effectiveTo)
+        : null;
+    return effectiveToDay === null || dayNumber < effectiveToDay;
+};
+const buildStorageRateLineItems = ({ rates = [], booking = {}, storageRange = null }) => {
+    if (!storageRange || storageRange.startDay === null || storageRange.endDay === null || storageRange.endDay < storageRange.startDay)
+        return [];
+    const segments = [];
+    const currentByChargeCode = new Map();
+    const firstDay = storageRange.startDay;
+    for (let dayNumber = storageRange.startDay; dayNumber <= storageRange.endDay; dayNumber += 1) {
+        const dayRates = rates.filter((rate) => rateIsEffectiveOnCalendarDay(rate, dayNumber));
+        const selectedRates = getLatestRateByChargeCode(dayRates, booking);
+        const storageDayOrdinal = (dayNumber - firstDay) + 1;
+        for (const selectedRate of selectedRates) {
+            const freeDays = Math.max(Number(selectedRate.freeDays) || 0, 0);
+            if (storageDayOrdinal <= freeDays)
+                continue;
+            const chargeCode = String(selectedRate.chargeCode || selectedRate.description || selectedRate._id || "storage");
+            const rateId = String(selectedRate._id || "");
+            const current = currentByChargeCode.get(chargeCode);
+            if (current && String(current.rate._id || "") === rateId && current.endDay + 1 === dayNumber) {
+                current.endDay = dayNumber;
+                current.quantity += 1;
+                continue;
+            }
+            const nextSegment = { rate: selectedRate, startDay: dayNumber, endDay: dayNumber, quantity: 1 };
+            segments.push(nextSegment);
+            currentByChargeCode.set(chargeCode, nextSegment);
+        }
+    }
+    return segments.map((segment) => {
+        const rate = segment.rate;
+        const quantity = segment.quantity;
+        const rawAmount = quantity * (Number(rate.rateAmount) || 0);
+        const minimumAmount = Math.max(Number(rate.minimumAmount) || 0, 0);
+        const amount = quantity > 0 ? Math.max(rawAmount, minimumAmount) : 0;
+        return {
+            rate: rate._id,
+            chargeCode: rate.chargeCode,
+            description: rate.description || "Storage",
+            unit: rate.unit || "storage_day",
+            quantity: Math.round(quantity * 100) / 100,
+            rateAmount: Number(rate.rateAmount) || 0,
+            freeDays: Math.max(Number(rate.freeDays) || 0, 0),
+            minimumAmount,
+            category: rate.category || "container_yard_operation",
+            billingScope: rate.billingScope || "storage",
+            rateType: normalizeRateType(rate.rateType),
+            rateLoadStatus: rate.loadStatus || "all",
+            rateEffectiveDate: rate.effectiveDate || calendarDayNumberToDate(segment.startDay),
+            rateVersion: Math.max(Number(rate.version) || 1, 1),
+            ratePeriodStart: calendarDayNumberToDate(segment.startDay),
+            ratePeriodEnd: calendarDayNumberToDate(segment.endDay),
+            ratePeriodLabel: formatStoragePeriodLabel(segment.startDay, segment.endDay),
+            amount: Math.round(amount * 100) / 100,
+        };
+    });
+};
 const getLoloPaymentStage = (booking = {}) => booking.loloPaymentStage === "gate_in" ? "gate_in" : "gate_out";
 const computeBookingBilling = async (booking, { asOf = new Date(), persist = false, useAsOfAsBillingEnd = false, phase = "auto" } = {}) => {
     const effectiveDate = new Date(asOf);
     const billingStage = resolveBillingStage(booking, phase);
+    const storageRange = billingStage === "gate_out"
+        ? getStorageBillingRange(booking, effectiveDate, { useAsOfAsBillingEnd })
+        : null;
     const stageRateLock = billingStage === "gate_in"
         ? booking.gateInRateEffectiveAt
             || (booking.billingStage === "gate_in" ? booking.billingComputedAt : null)
@@ -590,13 +689,11 @@ const computeBookingBilling = async (booking, { asOf = new Date(), persist = fal
             ? applicableRates.filter(isLiftOnLiftOffRate)
             : []
         : getLoloPaymentStage(booking) === "gate_in"
-            ? applicableRates.filter((rate) => !isLiftOnLiftOffRate(rate))
-            : applicableRates;
+            ? applicableRates.filter((rate) => !isLiftOnLiftOffRate(rate) && !isStorageRate(rate))
+            : applicableRates.filter((rate) => !isStorageRate(rate));
     const matchedRates = getLatestRateByChargeCode(stagedRates, booking);
-    const storageDays = billingStage === "gate_out"
-        ? getStorageDays(booking, effectiveDate, { useAsOfAsBillingEnd })
-        : 0;
-    const lineItems = matchedRates.map((rate) => {
+    const storageDays = storageRange?.days || 0;
+    const nonStorageLineItems = matchedRates.map((rate) => {
         const unit = rate.unit || "per_container";
         const freeDays = Math.max(Number(rate.freeDays) || 0, 0);
         let quantity = 1;
@@ -628,9 +725,35 @@ const computeBookingBilling = async (booking, { asOf = new Date(), persist = fal
             rateLoadStatus: rate.loadStatus || "all",
             rateEffectiveDate: rate.effectiveDate || normalizedRateEffectiveDate,
             rateVersion: Math.max(Number(rate.version) || 1, 1),
+            ratePeriodStart: null,
+            ratePeriodEnd: null,
+            ratePeriodLabel: "",
             amount: Math.round(amount * 100) / 100,
         };
     });
+    let storageLineItems = [];
+    let hasStorageRateMatch = false;
+    if (billingStage === "gate_out" && storageRange) {
+        const storageRateVersions = await BillingRate_js_1.default.find({
+            rateType: normalizeRateType(booking.rateType),
+        }).sort({ chargeCode: 1, effectiveDate: 1, createdAt: 1 });
+        const applicableStorageRates = storageRateVersions.filter((rate) => rateMatchesBooking(rate, booking)
+            && shouldApplyBillingRate(rate, booking)
+            && isStorageRate(rate));
+        hasStorageRateMatch = applicableStorageRates.some((rate) => {
+            for (let dayNumber = storageRange.startDay; dayNumber <= storageRange.endDay; dayNumber += 1) {
+                if (rateIsEffectiveOnCalendarDay(rate, dayNumber))
+                    return true;
+            }
+            return false;
+        });
+        storageLineItems = buildStorageRateLineItems({
+            rates: applicableStorageRates,
+            booking,
+            storageRange,
+        });
+    }
+    const lineItems = [...nonStorageLineItems, ...storageLineItems];
     const additionalLineItems = billingStage === "gate_out"
         ? (booking.additionalBillingCharges || []).map((item, index) => ({
             rate: null,
@@ -647,6 +770,9 @@ const computeBookingBilling = async (booking, { asOf = new Date(), persist = fal
             rateLoadStatus: booking.containerLoadStatus || "all",
             rateEffectiveDate: normalizedRateEffectiveDate,
             rateVersion: 1,
+            ratePeriodStart: null,
+            ratePeriodEnd: null,
+            ratePeriodLabel: "",
             amount: Math.round((Number(item.amount) || ((Number(item.quantity) || 0) * (Number(item.rateAmount) || 0))) * 100) / 100,
         }))
         : [];
@@ -668,7 +794,19 @@ const computeBookingBilling = async (booking, { asOf = new Date(), persist = fal
         days: storageDays,
         computedAt: effectiveDate,
         rateEffectiveAt: normalizedRateEffectiveDate,
-        hasMatchedRates: matchedRates.length > 0,
+        storageRatePeriods: storageLineItems.map((item) => ({
+            chargeCode: item.chargeCode,
+            rate: item.rate,
+            rateAmount: item.rateAmount,
+            rateVersion: item.rateVersion,
+            rateEffectiveDate: item.rateEffectiveDate,
+            ratePeriodStart: item.ratePeriodStart,
+            ratePeriodEnd: item.ratePeriodEnd,
+            ratePeriodLabel: item.ratePeriodLabel,
+            quantity: item.quantity,
+            amount: item.amount,
+        })),
+        hasMatchedRates: matchedRates.length > 0 || hasStorageRateMatch,
     };
     if (persist) {
         booking.billingStage = billingStage;
