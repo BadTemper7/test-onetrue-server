@@ -10,6 +10,7 @@ const InventoryContainer_js_1 = __importDefault(require("../models/InventoryCont
 const YardArea_js_1 = __importDefault(require("../models/YardArea.js"));
 const YardBlock_js_1 = __importDefault(require("../models/YardBlock.js"));
 const BillingRate_js_1 = __importDefault(require("../models/BillingRate.js"));
+const User_js_1 = __importDefault(require("../models/User.js"));
 const PaymentType_js_1 = __importDefault(require("../models/PaymentType.js"));
 const ReleaseReport_js_1 = __importDefault(require("../models/ReleaseReport.js"));
 const localFileStorage_js_1 = require("../utils/localFileStorage.js");
@@ -638,6 +639,16 @@ const makeRateLineItem = (rate, { quantity = 1, amount = null, description = nul
         amount: Math.round(normalizedAmount * 100) / 100,
     };
 };
+const getClientRateGroup = async (booking = {}) => {
+    if (!booking.client) return "";
+    const client = booking.client?.specialRateGroup ? booking.client : await User_js_1.default.findById(booking.client).select("specialRateGroup isSpecialClient").lean();
+    return client?.specialRateGroup || "";
+};
+const isSpecialClientBooking = async (booking = {}) => {
+    if (!booking.client) return false;
+    const client = booking.client?.isSpecialClient !== undefined ? booking.client : await User_js_1.default.findById(booking.client).select("specialRateGroup isSpecialClient").lean();
+    return Boolean(client?.isSpecialClient || client?.specialRateGroup);
+};
 const computeBookingBilling = async (booking, { asOf = new Date(), persist = false, useAsOfAsBillingEnd = false, phase = "auto" } = {}) => {
     const effectiveDate = parseBookingDate(asOf) || new Date();
     const billingStage = resolveBillingStage(booking, phase);
@@ -653,12 +664,22 @@ const computeBookingBilling = async (booking, { asOf = new Date(), persist = fal
         storageEnd,
     ].filter(Boolean);
     const queryThrough = new Date(Math.max(...relevantDates.map((date) => date.getTime())));
+    const clientRateGroup = await getClientRateGroup(booking);
     const rateVersions = await BillingRate_js_1.default.find({
         rateType: normalizeRateType(booking.rateType),
         effectiveDate: { $lte: queryThrough },
         status: { $in: ["active", "inactive"] },
+        $or: [
+            { clientRateGroup: clientRateGroup },
+            { clientRateGroup: "" },
+            { clientRateGroup: { $exists: false } },
+        ],
     }).sort({ sortOrder: 1, chargeCode: 1, effectiveDate: -1, createdAt: -1 });
-    const applicableRateVersions = rateVersions.filter((rate) => rateMatchesBooking(rate, booking) && shouldApplyBillingRate(rate, booking));
+    let applicableRateVersions = rateVersions.filter((rate) => rateMatchesBooking(rate, booking) && shouldApplyBillingRate(rate, booking));
+    if (clientRateGroup) {
+        const special = applicableRateVersions.filter((rate) => rate.clientRateGroup === clientRateGroup);
+        if (special.length) applicableRateVersions = special;
+    }
     const stagedRateVersions = billingStage === "gate_in"
         ? getLoloPaymentStage(booking) === "gate_in"
             ? applicableRateVersions.filter(isLiftOnLiftOffRate)
@@ -3227,7 +3248,15 @@ const rejectBookingGateOut = async (req, res) => {
     booking.gateOutRejectedAt = new Date();
     booking.gateOutRejectedBy = req.user._id;
     booking.gateOutRejectionReason = reason;
-    addHistory(booking, { remarks: `Gate-out request rejected by admin: ${reason}`, changedBy: req.user._id });
+    booking.status = "stored_in_assigned_area";
+    booking.gateOutRequestedAt = null;
+    booking.paymentBalanceDue = 0;
+    booking.paymentAmount = 0;
+    booking.gateOutPassNumber = "";
+    booking.gateOutScheduleStatus = "";
+    booking.gateOutRejectedAt = new Date();
+    addHistory(booking, { status: "stored_in_assigned_area", remarks: `Gate-out request rejected and container returned to inventory: ${reason}`, changedBy: req.user._id });
+    await InventoryContainer_js_1.default.findOneAndUpdate({ booking: booking._id }, { status: "in_yard" });
     await booking.save();
     await booking.populate("client", "name email companyName phoneNumber");
     await booking.populate("assignedArea", "name code isCongestionArea");
@@ -3249,8 +3278,12 @@ const approveBookingGateOut = async (req, res) => {
     if (booking.status !== "gate_out_requested") {
         return res.status(400).json({ success: false, message: "Only requested gate-out bookings can be approved." });
     }
-    if (booking.billingStatus !== "paid_approved") {
+    const specialClientRelease = await isSpecialClientBooking(booking);
+    if (booking.billingStatus !== "paid_approved" && !specialClientRelease) {
         return res.status(403).json({ success: false, message: "Payment must be paid / approved before gate-out approval." });
+    }
+    if (specialClientRelease && booking.billingStatus !== "paid_approved") {
+        booking.billingStatus = "special_client_release_pending";
     }
     booking.status = "gate_out_approved";
     booking.gateOutRejectedAt = null;

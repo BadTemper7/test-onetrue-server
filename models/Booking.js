@@ -92,6 +92,7 @@ const paymentTransactionSchema = new mongoose_1.default.Schema({
 }, { _id: true });
 const bookingSchema = new mongoose_1.default.Schema({
     client: { type: mongoose_1.default.Schema.Types.ObjectId, ref: "User", default: null, index: true },
+    specialClientGateOutBypass: { type: Boolean, default: false },
     recordSource: { type: String, enum: ["client_booking", "admin_manual", "legacy_migration"], default: "client_booking", index: true },
     legacyRegistrationNumber: { type: String, default: "", trim: true, index: true },
     legacyRegisteredAt: { type: Date, default: null },

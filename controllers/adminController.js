@@ -77,7 +77,7 @@ const updateUser = async (req, res) => {
     if (!user) {
         return res.status(404).json({ success: false, message: "User not found." });
     }
-    const { name, email, status, role, permissions, companyName, companyAddress, companyType, companyTypeOther, phoneNumber, representativeFirstName, representativeMiddleName, representativeLastName, representativePosition, } = req.body;
+    const { name, email, status, role, permissions, companyName, companyAddress, companyType, companyTypeOther, phoneNumber, representativeFirstName, representativeMiddleName, representativeLastName, representativePosition, specialRateGroup, isSpecialClient, } = req.body;
     if (user.isLockedSeed) {
         user.name = name || user.name;
     }
@@ -105,6 +105,10 @@ const updateUser = async (req, res) => {
     user.representativeMiddleName = representativeMiddleName ?? user.representativeMiddleName;
     user.representativeLastName = representativeLastName ?? user.representativeLastName;
     user.representativePosition = representativePosition ?? user.representativePosition;
+    if (user.userType === "client") {
+        user.specialRateGroup = ["Rate 1", "Rate 2", "Rate 3"].includes(specialRateGroup) ? specialRateGroup : "";
+        user.isSpecialClient = Boolean(isSpecialClient) || Boolean(user.specialRateGroup);
+    }
     await user.save();
     const payload = (0, authController_js_1.safeUser)(user);
     (0, socket_js_1.emitToAdmins)("admin:user_updated", payload);

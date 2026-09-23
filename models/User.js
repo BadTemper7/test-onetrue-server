@@ -45,6 +45,8 @@ const userSchema = new mongoose_1.default.Schema({
     companyType: { type: String, default: "" },
     companyTypeOther: { type: String, default: "" },
     companyMarket: { type: String, enum: ["local", "international"], default: "local", index: true },
+    specialRateGroup: { type: String, enum: ["", "Rate 1", "Rate 2", "Rate 3"], default: "", index: true },
+    isSpecialClient: { type: Boolean, default: false, index: true },
     phoneNumber: { type: String, default: "" },
     representativeFirstName: { type: String, default: "" },
     representativeMiddleName: { type: String, default: "" },
