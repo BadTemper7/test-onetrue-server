@@ -8,7 +8,6 @@ const billingRateSchema = new mongoose_1.default.Schema({
     description: { type: String, required: true, trim: true },
     chargeCode: { type: String, required: true, uppercase: true, trim: true },
     rateType: { type: String, enum: ["local", "international"], default: "local", index: true },
-    clientRateGroup: { type: String, enum: ["", "Rate 1", "Rate 2", "Rate 3"], default: "", index: true },
     category: {
         type: String,
         enum: ["container_yard_operation", "stripping_stuffing", "custom"],

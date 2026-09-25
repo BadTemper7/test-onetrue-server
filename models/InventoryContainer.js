@@ -5,7 +5,6 @@ var __importDefault = (this && this.__importDefault) || function (mod) {
 Object.defineProperty(exports, "__esModule", { value: true });
 const mongoose_1 = __importDefault(require("mongoose"));
 const inventoryContainerSchema = new mongoose_1.default.Schema({
-    booking: { type: mongoose_1.default.Schema.Types.ObjectId, ref: "Booking", default: null, index: true },
     preAdvice: { type: mongoose_1.default.Schema.Types.ObjectId, ref: "PreAdvice", required: true, unique: true, index: true },
     gateIn: { type: mongoose_1.default.Schema.Types.ObjectId, ref: "GateInRecord", required: true, unique: true, index: true },
     client: { type: mongoose_1.default.Schema.Types.ObjectId, ref: "User", required: true, index: true },

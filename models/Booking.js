@@ -31,6 +31,10 @@ const billingLineItemSchema = new mongoose_1.default.Schema({
     rateLoadStatus: { type: String, enum: ["all", "empty", "laden"], default: "all" },
     rateEffectiveDate: { type: Date, default: null },
     rateVersion: { type: Number, default: 1 },
+    isSpecialRate: { type: Boolean, default: false },
+    specialRate: { type: mongoose_1.default.Schema.Types.ObjectId, ref: "SpecialRate", default: null },
+    specialRateName: { type: String, default: "", trim: true },
+    generalRateAmount: { type: Number, default: 0 },
     serviceDate: { type: Date, default: null },
     billingPeriodStart: { type: Date, default: null },
     billingPeriodEnd: { type: Date, default: null },
@@ -92,7 +96,6 @@ const paymentTransactionSchema = new mongoose_1.default.Schema({
 }, { _id: true });
 const bookingSchema = new mongoose_1.default.Schema({
     client: { type: mongoose_1.default.Schema.Types.ObjectId, ref: "User", default: null, index: true },
-    specialClientGateOutBypass: { type: Boolean, default: false },
     recordSource: { type: String, enum: ["client_booking", "admin_manual", "legacy_migration"], default: "client_booking", index: true },
     legacyRegistrationNumber: { type: String, default: "", trim: true, index: true },
     legacyRegisteredAt: { type: Date, default: null },

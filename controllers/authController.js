@@ -70,8 +70,6 @@ const safeUser = (user) => {
         companyType: user.companyType,
         companyTypeOther: user.companyTypeOther,
         companyMarket: user.companyMarket === "international" ? "international" : "local",
-        specialRateGroup: user.specialRateGroup || "",
-        isSpecialClient: Boolean(user.isSpecialClient || user.specialRateGroup),
         phoneNumber: user.phoneNumber,
         representativeFirstName: user.representativeFirstName,
         representativeMiddleName: user.representativeMiddleName,
