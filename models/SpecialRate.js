@@ -29,7 +29,7 @@ const specialRateSchema = new mongoose_1.default.Schema({
     updatedBy: { type: mongoose_1.default.Schema.Types.ObjectId, ref: "User", default: null },
 }, { timestamps: true });
 specialRateSchema.index({ clients: 1, status: 1, effectiveDate: -1, effectiveTo: 1 });
-specialRateSchema.index({ "transactions.transactionKey": 1, clients: 1, status: 1, effectiveDate: -1 });
+specialRateSchema.index({ "transactions.transactionKey": 1, status: 1, effectiveDate: -1, effectiveTo: 1 });
 specialRateSchema.pre("validate", function () {
     this.name = String(this.name || "").trim();
     this.clients = [...new Set((this.clients || []).map((id) => String(id)))];
