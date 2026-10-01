@@ -586,21 +586,20 @@ const formatCalendarDay = (calendarDay) => {
         return "";
     return date.toISOString().slice(0, 10);
 };
+const getBookingLoloRateDate = (booking = {}, fallbackDate = new Date()) =>
+    parseBookingDate(booking.submittedAt || booking.createdAt || booking.approvedAt || booking.expectedArrivalDate)
+    || parseBookingDate(fallbackDate)
+    || new Date();
 const getBillingEventDate = (rate = {}, booking = {}, billingStage = "gate_out", fallbackDate = new Date()) => {
     const fallback = parseBookingDate(fallbackDate) || new Date();
     const code = String(rate.chargeCode || "").toUpperCase();
     const inDate = parseBookingDate(booking.gateInApprovedAt || booking.inDate || booking.storageStartDate || booking.storedAt || booking.approvedAt || booking.expectedArrivalDate || booking.createdAt);
     const outDate = parseBookingDate(booking.releasedAt || booking.outDate);
-    if (/^LIFT_ON(?:_|$)/.test(code))
-        return inDate || fallback;
-    if (/^LIFT_OFF(?:_|$)/.test(code)) {
-        // When LOLO is prepaid at Gate-In, both handling charges keep the
-        // Gate-In rate snapshot. When LOLO is deferred, Lift Off follows the
-        // actual Gate-Out/service date so future rate changes apply correctly.
-        if (billingStage === "gate_in")
-            return inDate || fallback;
-        return outDate || fallback;
-    }
+    // General LOLO pricing is locked to the booking date. Lift On and Lift Off
+    // must therefore resolve against the same historical rate version even when
+    // Gate-Out happens after a newer General Rate becomes effective.
+    if (/^LIFT_(?:ON|OFF)(?:_|$)/.test(code))
+        return getBookingLoloRateDate(booking, fallback);
     if (billingStage === "gate_in")
         return inDate || parseBookingDate(booking.approvedAt) || fallback;
     return outDate || fallback;
@@ -653,11 +652,13 @@ const loadClientSpecialRates = async (booking, queryThrough) => {
         clients: clientId,
         status: "active",
         effectiveDate: { $lte: queryThrough },
-        $or: [{ effectiveTo: null }, { effectiveTo: { $gt: new Date(0) } }, { effectiveTo: { $exists: false } }],
     }).sort({ effectiveDate: -1, updatedAt: -1 }).lean();
 };
-const getSpecialRateAmount = (specialRates = [], rate = {}, serviceDate = new Date()) => {
-    const when = new Date(serviceDate);
+const getSpecialRateAmount = (specialRates = [], rate = {}, applicableAt = new Date()) => {
+    // Special Rates are client overrides, not historical booking snapshots.
+    // Once effective, they apply to matching transactions for both old and new
+    // bookings. effectiveTo still stops the override when configured.
+    const when = new Date(applicableAt);
     const key = getBillingRateTransactionKey(rate);
     for (const group of specialRates) {
         const from = new Date(group.effectiveDate);
@@ -689,13 +690,17 @@ const computeBookingBilling = async (booking, { asOf = new Date(), persist = fal
         storageEnd,
     ].filter(Boolean);
     const queryThrough = new Date(Math.max(...relevantDates.map((date) => date.getTime())));
+    // General rates follow their historical service/booking dates, while Special
+    // Rates are client overrides that become active based on the time billing is
+    // processed. This lets a newly-effective Special Rate override old bookings.
+    const specialRateAsOf = new Date();
     const [rateVersions, clientSpecialRates] = await Promise.all([
         BillingRate_js_1.default.find({
             rateType: normalizeRateType(booking.rateType),
             effectiveDate: { $lte: queryThrough },
             status: { $in: ["active", "inactive"] },
         }).sort({ sortOrder: 1, chargeCode: 1, effectiveDate: -1, createdAt: -1 }),
-        loadClientSpecialRates(booking, queryThrough),
+        loadClientSpecialRates(booking, specialRateAsOf),
     ]);
     const applicableRateVersions = rateVersions.filter((rate) => rateMatchesBooking(rate, booking) && shouldApplyBillingRate(rate, booking));
     const stagedRateVersions = billingStage === "gate_in"
@@ -725,7 +730,7 @@ const computeBookingBilling = async (booking, { asOf = new Date(), persist = fal
         if (!selectedRate)
             continue;
         matchedRateIds.add(String(selectedRate._id));
-        const specialMatch = getSpecialRateAmount(clientSpecialRates, selectedRate, serviceDate);
+        const specialMatch = getSpecialRateAmount(clientSpecialRates, selectedRate, specialRateAsOf);
         const billedRate = applySpecialRateToRate(selectedRate, specialMatch);
         const quantity = billedRate.unit === "per_teu" ? getTeuFactor(booking.containerSize) : 1;
         const lineItem = makeRateLineItem(billedRate, { quantity, serviceDate });
@@ -759,7 +764,7 @@ const computeBookingBilling = async (booking, { asOf = new Date(), persist = fal
                     if (transactionDayNumber <= freeDays)
                         continue;
                     const serviceDate = calendarDayToDate(day);
-                    const specialMatch = getSpecialRateAmount(clientSpecialRates, rate, serviceDate);
+                    const specialMatch = getSpecialRateAmount(clientSpecialRates, rate, specialRateAsOf);
                     const billedRate = applySpecialRateToRate(rate, specialMatch);
                     const key = `${String(rate._id)}:${String(rate.chargeCode || rate.description || "")}:${specialMatch ? String(specialMatch.specialRateId) : "general"}:${Number(billedRate.rateAmount) || 0}`;
                     const existing = groups.get(key);
@@ -3291,7 +3296,21 @@ const rejectBookingGateOut = async (req, res) => {
     booking.gateOutRejectedAt = new Date();
     booking.gateOutRejectedBy = req.user._id;
     booking.gateOutRejectionReason = reason;
-    addHistory(booking, { remarks: `Gate-out request rejected by admin: ${reason}`, changedBy: req.user._id });
+
+    // A rejected Gate-Out means the container never left the yard. Return it
+    // to the stored inventory state so the client/admin can request Gate-Out
+    // again with a new Date Out. Keep the rejection audit fields above.
+    booking.status = "stored_in_assigned_area";
+    booking.outDate = null;
+    booking.gateOutRequestedAt = null;
+    booking.gateOutRequestRemarks = "";
+    booking.gateOutApprovedAt = null;
+    booking.gateOutApprovedBy = null;
+    booking.gateOutPassNumber = "";
+    booking.gateOutScheduleStatus = "not_scheduled";
+    booking.gateOutOverstayStartedAt = null;
+    booking.gateOutRateEffectiveAt = null;
+    addHistory(booking, { status: "stored_in_assigned_area", remarks: `Gate-out request rejected by admin: ${reason}. Container returned to Inventory and may request Gate-Out again.`, changedBy: req.user._id });
     await booking.save();
     await booking.populate("client", "name email companyName phoneNumber");
     await booking.populate("assignedArea", "name code isCongestionArea");
@@ -3299,11 +3318,11 @@ const rejectBookingGateOut = async (req, res) => {
     const payload = safeBooking(booking);
     (0, socket_js_1.emitToAdmins)("booking:gate_out_rejected", payload);
     (0, socket_js_1.emitToUser)(booking.client?._id || booking.client, "booking:gate_out_rejected", payload);
-    await notifyClient(booking, "Gate-out request rejected", "Your gate-out request requires correction or additional coordination before release approval.", [
+    await notifyClient(booking, "Gate-out request rejected", "Your gate-out request was rejected. The container has been returned to Inventory and you may submit a new Gate-Out request.", [
         { label: "Container", value: booking.containerNumber },
         { label: "Reason", value: reason },
     ]);
-    return res.json({ success: true, message: "Gate-out request rejected.", booking: payload });
+    return res.json({ success: true, message: "Gate-out request rejected. Container returned to Inventory and can request Gate-Out again.", booking: payload });
 };
 exports.rejectBookingGateOut = rejectBookingGateOut;
 const approveBookingGateOut = async (req, res) => {
