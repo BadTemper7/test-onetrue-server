@@ -165,6 +165,7 @@ const recalculateBlockOccupancy = async (blockId) => {
 const safeBookingContainer = (booking) => {
     const doc = booking.toObject ? booking.toObject() : booking;
     const client = doc.client || {};
+    const cmaClient = doc.cmaClient || null;
     const area = doc.assignedArea || null;
     const block = doc.assignedBlock || null;
     const legacyRegisteredBy = doc.legacyRegisteredBy || null;
@@ -197,6 +198,11 @@ const safeBookingContainer = (booking) => {
         containerLoadStatus: doc.containerLoadStatus,
         rateType: normalizeRateType(doc.rateType),
         shippingLine: doc.shippingLine,
+        isCMASpecialClient: Boolean(doc.isCMASpecialClient),
+        cmaClient: cmaClient?._id ? String(cmaClient._id) : doc.cmaClient ? String(doc.cmaClient) : "",
+        cmaClientName: cmaClient?.name || "",
+        cmaClientCode: cmaClient?.code || "",
+        cmaIdentificationSource: doc.cmaIdentificationSource || "none",
         bookingNumber: doc.bookingNumber || "",
         blNumber: doc.blNumber || "",
         customerName: client.companyName || client.name || "",
@@ -591,6 +597,7 @@ const INVENTORY_BOOKING_SELECT = [
     "recordSource", "legacyRegistrationNumber", "legacyRegisteredAt", "legacyRegisteredBy", "legacyRegistrationReason",
     "historicalGateInDateType", "historicalSourceReference", "billingStartMethod", "migrationDate", "openingBalanceAmount", "openingCreditAmount",
     "bookingReference", "client", "containerNumber", "containerSize", "containerType", "containerLoadStatus", "rateType", "shippingLine",
+    "isCMASpecialClient", "cmaClient", "cmaIdentificationSource", "cmaIdentifiedAt",
     "bookingNumber", "blNumber", "status", "billingStatus", "assignedArea", "assignedBlock", "assignedBay", "assignedRow", "assignedTier",
     "assignedSlotNumber", "gateInApprovedAt", "storedAt", "storageStartDate", "inDate", "expectedArrivalDate", "outDate", "releasedAt",
     "gateOutGracePeriodMinutes", "gateOutScheduleStatus", "gateOutOverstayStartedAt", "physicalCondition", "truckPlateNumber", "driverName",
@@ -751,6 +758,7 @@ const listInventoryContainers = async (req, res) => {
         : Booking_js_1.default.find(bookingQuery)
             .select(INVENTORY_BOOKING_SELECT)
             .populate("client", "name email companyName")
+            .populate("cmaClient", "name code")
             .populate("assignedArea", "name code")
             .populate("assignedBlock", "name code")
             .populate("legacyRegisteredBy", "name")

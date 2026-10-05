@@ -124,6 +124,16 @@ const bookingSchema = new mongoose_1.default.Schema({
         index: true,
     },
     shippingLine: { type: String, required: true, trim: true },
+    isCMASpecialClient: { type: Boolean, default: false, index: true },
+    cmaClient: { type: mongoose_1.default.Schema.Types.ObjectId, ref: "CMAClient", default: null, index: true },
+    cmaIdentificationSource: {
+        type: String,
+        enum: ["none", "client_relationship", "shipping_line", "manual"],
+        default: "none",
+        index: true,
+    },
+    cmaIdentifiedAt: { type: Date, default: null },
+    cmaIdentifiedBy: { type: mongoose_1.default.Schema.Types.ObjectId, ref: "User", default: null },
     bookingNumber: { type: String, default: "", trim: true },
     qrCodeValue: { type: String, default: "", trim: true },
     blNumber: { type: String, default: "", trim: true },
@@ -298,6 +308,12 @@ bookingSchema.pre("validate", function () {
         this.actualContainerNumber = String(this.actualContainerNumber).toUpperCase().replace(/[^A-Z0-9]/g, "").trim();
     }
     this.rateType = this.rateType === "international" ? "international" : "local";
+    if (!this.isCMASpecialClient) {
+        this.cmaClient = null;
+        this.cmaIdentificationSource = "none";
+        this.cmaIdentifiedAt = null;
+        this.cmaIdentifiedBy = null;
+    }
     this.loloPaymentStage = this.loloPaymentStage === "gate_in" ? "gate_in" : "gate_out";
     this.assignedBay = Math.max(Number(this.assignedBay) || 1, 1);
     this.assignedRow = Math.max(Number(this.assignedRow) || 1, 1);

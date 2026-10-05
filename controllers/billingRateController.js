@@ -32,6 +32,8 @@ const getChargeType = (rate = {}) => {
         return "total_handling";
     if (/congestion/.test(text))
         return "congestion";
+    if (/documentation|document_fee|doc_fee/.test(text))
+        return "documentation";
     return "other";
 };
 const isDocumentationRate = (rate = {}) => /documentation|document_fee|doc_fee/.test(`${rate.description || ""} ${rate.chargeCode || ""}`.toLowerCase());
@@ -152,7 +154,9 @@ const inferRateRules = ({ description = "", unitLabel = "", requestedUnit = "", 
         unit = "per_container";
     }
     let billingScope = currentRate?.billingScope || "base";
-    if (isTotalHandling || isCongestion)
+    if (isDocumentation)
+        billingScope = "cma_documentation";
+    else if (isTotalHandling || isCongestion)
         billingScope = "display_only";
     else if (isStrippingStuffing)
         billingScope = "optional_stripping_stuffing";
@@ -189,7 +193,7 @@ const inferRateRules = ({ description = "", unitLabel = "", requestedUnit = "", 
                 : isStorage && ["20", "40"].includes(containerSize)
                     ? `STORAGE_${containerSize}_DAY`
                     : isDocumentation
-                        ? "DOCUMENTATION"
+                        ? "CMA_DOCUMENTATION_FEE"
                         : "";
     return {
         category,
@@ -393,9 +397,9 @@ const listBillingRates = async (req, res) => {
     }
     return res.json({
         success: true,
-        rates: Array.from(latestByConfig.values()).filter((rate) => !isDocumentationRate(rate)).map(safeRate),
-        scheduledRates: scheduledRates.filter((rate) => !isDocumentationRate(rate)).map(safeRate),
-        referenceRates: exports.OTLI_REFERENCE_RATES.filter((rate) => rate.billingScope !== "optional_stripping_stuffing" && !isDocumentationRate(rate)),
+        rates: Array.from(latestByConfig.values()).map(safeRate),
+        scheduledRates: scheduledRates.map(safeRate),
+        referenceRates: exports.OTLI_REFERENCE_RATES.filter((rate) => rate.billingScope !== "optional_stripping_stuffing"),
     });
 };
 exports.listBillingRates = listBillingRates;
@@ -410,9 +414,6 @@ const createBillingRate = async (req, res) => {
     const payload = buildRatePayload(req.body);
     if (!payload.description || !payload.unitLabel) {
         return res.status(400).json({ success: false, message: "Description and Unit are required." });
-    }
-    if (isDocumentationRate(payload)) {
-        return res.status(400).json({ success: false, message: "Documentation Fee has been removed and cannot be configured." });
     }
     if (payload.rateAmount <= 0) {
         return res.status(400).json({ success: false, message: "Rate amount must be greater than zero." });
@@ -447,9 +448,6 @@ const updateBillingRate = async (req, res) => {
     const payload = buildRatePayload(req.body, currentRate);
     if (!payload.description || !payload.unitLabel) {
         return res.status(400).json({ success: false, message: "Description and Unit are required." });
-    }
-    if (isDocumentationRate(payload)) {
-        return res.status(400).json({ success: false, message: "Documentation Fee has been removed and cannot be configured." });
     }
     if (payload.rateAmount <= 0) {
         return res.status(400).json({ success: false, message: "Rate amount must be greater than zero." });
