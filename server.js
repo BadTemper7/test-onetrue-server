@@ -1,5 +1,22 @@
 // Seed manually with: npm run seed. Do not seed during API startup.
 require("dotenv").config();
+
+// Force public DNS resolvers BEFORE mongoose connects. Some hosts (Hostinger,
+// shared hosting, certain container environments) have broken or restricted
+// resolvers that make `mongodb+srv://` fail with ECONNREFUSED/ENOTFOUND on SRV
+// lookups. Override with DNS_SERVERS="1.1.1.1,8.8.8.8" if desired.
+const dns = require("dns");
+const dnsServers = String(process.env.DNS_SERVERS || "8.8.8.8,1.1.1.1")
+  .split(",")
+  .map((s) => s.trim())
+  .filter(Boolean);
+try {
+  dns.setServers(dnsServers);
+  console.log(`🌐 DNS servers set to: ${dnsServers.join(", ")}`);
+} catch (dnsError) {
+  console.warn(`⚠️  Could not set custom DNS servers: ${dnsError.message}`);
+}
+
 const express = require("express");
 const http = require("http");
 const mongoose = require("mongoose");
@@ -16,7 +33,9 @@ const PORT = process.env.PORT || 3000;
 
 // Middleware
 const allowedOrigins = String(process.env.CORS_ORIGINS || "")
-  .split(",").map(x => x.trim()).filter(Boolean);
+  .split(",")
+  .map((x) => x.trim())
+  .filter(Boolean);
 if (process.env.NODE_ENV === "production" && !allowedOrigins.length) {
   throw new Error("CORS_ORIGINS must be configured in production.");
 }
@@ -34,8 +53,13 @@ const { resolveStoredFilePath } = require("./utils/localFileStorage.js");
 app.get("/documents/:owner/:file", protect, async (req, res) => {
   const owner = String(req.params.owner);
   const isAdmin = req.user.userType === "admin" && req.user.status === "active";
-  if (!isAdmin && (req.user.userType !== "client" || String(req.user._id) !== owner)) {
-    return res.status(403).json({ success: false, message: "Document access denied." });
+  if (
+    !isAdmin &&
+    (req.user.userType !== "client" || String(req.user._id) !== owner)
+  ) {
+    return res
+      .status(403)
+      .json({ success: false, message: "Document access denied." });
   }
   const filePath = resolveStoredFilePath(`${owner}/${req.params.file}`);
   if (!filePath) return res.sendStatus(404);
@@ -55,7 +79,6 @@ app.get("/documents/:owner/:file", protect, async (req, res) => {
 // MongoDB Connection
 const MONGODB_URI =
   process.env.MONGODB_URI || "mongodb://localhost:27017/testdb";
-
 
 // ==================== MODELS ====================
 
@@ -151,7 +174,8 @@ app.use((err, req, res, next) => {
   console.error("Error:", err.stack);
   res.status(500).json({
     error: "Something went wrong!",
-    message: process.env.NODE_ENV === "production" ? "Request failed." : err.message,
+    message:
+      process.env.NODE_ENV === "production" ? "Request failed." : err.message,
   });
 });
 
@@ -184,19 +208,28 @@ const startServer = async () => {
   // indexes instead: one starting with `clients`, and another starting with
   // `transactions.transactionKey`.
   try {
-    const specialRatesCollection = mongoose.connection.collection("specialrates");
+    const specialRatesCollection =
+      mongoose.connection.collection("specialrates");
     const indexes = await specialRatesCollection.indexes();
 
     for (const index of indexes) {
       const keys = index?.key || {};
-      if (keys.clients !== undefined && keys["transactions.transactionKey"] !== undefined) {
-        console.warn(`Legacy Special Rate index requires reviewed manual migration: ${index.name}`);
+      if (
+        keys.clients !== undefined &&
+        keys["transactions.transactionKey"] !== undefined
+      ) {
+        console.warn(
+          `Legacy Special Rate index requires reviewed manual migration: ${index.name}`,
+        );
       }
     }
   } catch (indexError) {
     // NamespaceNotFound simply means the collection has not been created yet.
     // Do not prevent the API from starting for that case.
-    if (indexError?.codeName !== "NamespaceNotFound" && indexError?.code !== 26) {
+    if (
+      indexError?.codeName !== "NamespaceNotFound" &&
+      indexError?.code !== 26
+    ) {
       throw indexError;
     }
   }
