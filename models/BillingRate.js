@@ -16,7 +16,7 @@ const billingRateSchema = new mongoose_1.default.Schema({
     },
     billingScope: {
         type: String,
-        enum: ["base", "storage", "optional_stripping_stuffing", "display_only", "cma_documentation"],
+        enum: ["base", "storage", "optional_stripping_stuffing", "display_only"],
         default: "base",
         index: true,
     },
@@ -54,7 +54,7 @@ billingRateSchema.pre("validate", function () {
     this.chargeCode = String(this.chargeCode || this.description || "").toUpperCase().replace(/[^A-Z0-9]+/g, "_").replace(/^_+|_+$/g, "");
     this.rateType = this.rateType === "international" ? "international" : "local";
     this.category = ["container_yard_operation", "stripping_stuffing", "custom"].includes(this.category) ? this.category : "container_yard_operation";
-    this.billingScope = ["base", "storage", "optional_stripping_stuffing", "display_only", "cma_documentation"].includes(this.billingScope) ? this.billingScope : "base";
+    this.billingScope = ["base", "storage", "optional_stripping_stuffing", "display_only"].includes(this.billingScope) ? this.billingScope : "base";
     this.containerSize = String(this.containerSize || "all");
     this.containerType = String(this.containerType || "all");
     this.loadStatus = String(this.loadStatus || "all").trim().toLowerCase();

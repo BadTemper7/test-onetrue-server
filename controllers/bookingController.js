@@ -20,7 +20,6 @@ const socket_js_1 = require("../socket/socket.js");
 const bookingNumber_js_1 = require("../utils/bookingNumber.js");
 const billingDays_js_1 = require("../utils/billingDays.js");
 const notificationService_js_1 = require("../utils/notificationService.js");
-const cmaService_js_1 = require("../utils/cmaService.js");
 const ACTIVE_BOOKING_STATUSES = [
     "approved_area_assigned",
     "gate_in_approved",
@@ -400,8 +399,8 @@ const getLatestRateByChargeCode = (rates = [], booking = {}) => {
 const shouldApplyBillingRate = (rate, booking) => {
     const scope = String(rate.billingScope || "base");
     const rateText = `${rate.chargeCode || ""} ${rate.description || ""}`.toLowerCase();
-    if (/documentation|document_fee|doc_fee/.test(rateText) || scope === "cma_documentation")
-        return Boolean(booking.isCMASpecialClient);
+    if (/documentation|document_fee|doc_fee/.test(rateText))
+        return false;
     if (scope === "display_only")
         return false;
     if (scope === "optional_stripping_stuffing") return false;
@@ -704,17 +703,13 @@ const computeBookingBilling = async (booking, { asOf = new Date(), persist = fal
         loadClientSpecialRates(booking, specialRateAsOf),
     ]);
     const applicableRateVersions = rateVersions.filter((rate) => rateMatchesBooking(rate, booking) && shouldApplyBillingRate(rate, booking));
-    // CMA Special Clients are billed to the trucker for Documentation Fee only.
-    // LOLO, storage and other yard charges are computed in the independent CMA Billing module.
-    const stagedRateVersions = booking.isCMASpecialClient
-        ? applicableRateVersions.filter(cmaService_js_1.isDocumentationFeeRate)
-        : billingStage === "gate_in"
-            ? getLoloPaymentStage(booking) === "gate_in"
-                ? applicableRateVersions.filter(isLiftOnLiftOffRate)
-                : []
-            : getLoloPaymentStage(booking) === "gate_in"
-                ? applicableRateVersions.filter((rate) => !isLiftOnLiftOffRate(rate))
-                : applicableRateVersions;
+    const stagedRateVersions = billingStage === "gate_in"
+        ? getLoloPaymentStage(booking) === "gate_in"
+            ? applicableRateVersions.filter(isLiftOnLiftOffRate)
+            : []
+        : getLoloPaymentStage(booking) === "gate_in"
+            ? applicableRateVersions.filter((rate) => !isLiftOnLiftOffRate(rate))
+            : applicableRateVersions;
 
     const dailyRateVersions = stagedRateVersions.filter(isDailyBillingRate);
     const eventRateVersions = stagedRateVersions.filter((rate) => !isDailyBillingRate(rate));
@@ -805,7 +800,7 @@ const computeBookingBilling = async (booking, { asOf = new Date(), persist = fal
         }
     }
 
-    const additionalLineItems = billingStage === "gate_out" && !booking.isCMASpecialClient
+    const additionalLineItems = billingStage === "gate_out"
         ? (booking.additionalBillingCharges || []).map((item, index) => ({
             rate: null,
             chargeCode: item.chargeCode || `ADDITIONAL_${index + 1}`,
@@ -920,7 +915,6 @@ const addHistory = (booking, { status = booking.status, billingStatus = booking.
 const populateBooking = (query) => {
     return query
         .populate("client", "name email companyName phoneNumber")
-        .populate("cmaClient", "name code")
         .populate("assignedArea", "name code isCongestionArea")
         .populate("assignedBlock", "name code teuSlots occupiedSlots bayCount rowCount tierCount containerSize")
         .populate("approvedBy", "name")
@@ -951,7 +945,6 @@ const getGateOutBillingTotal = (booking = {}) => {
 const safeBooking = (booking) => {
     const doc = booking.toObject ? booking.toObject() : booking;
     const client = doc.client || {};
-    const cmaClient = doc.cmaClient || null;
     const area = doc.assignedArea || null;
     const block = doc.assignedBlock || null;
     const approvedBy = doc.approvedBy || null;
@@ -993,12 +986,6 @@ const safeBooking = (booking) => {
         serviceType: doc.serviceType || "container_yard",
         rateType: normalizeRateType(doc.rateType),
         shippingLine: doc.shippingLine,
-        isCMASpecialClient: Boolean(doc.isCMASpecialClient),
-        cmaClient: cmaClient?._id ? String(cmaClient._id) : doc.cmaClient ? String(doc.cmaClient) : "",
-        cmaClientName: cmaClient?.name || "",
-        cmaClientCode: cmaClient?.code || "",
-        cmaIdentificationSource: doc.cmaIdentificationSource || "none",
-        cmaIdentifiedAt: doc.cmaIdentifiedAt || null,
         bookingNumber: doc.bookingNumber || "",
         qrCodeValue: doc.qrCodeValue || "",
         blNumber: doc.blNumber || "",
@@ -1610,7 +1597,6 @@ const createClientBooking = async (req, res) => {
         bookingReference,
         clientId: req.user._id,
     });
-    const cmaMatch = await (0, cmaService_js_1.resolveCMAClientForBooking)({ clientId: req.user._id, shippingLine });
     const booking = await Booking_js_1.default.create({
         client: req.user._id,
         bookingReference,
@@ -1621,12 +1607,6 @@ const createClientBooking = async (req, res) => {
         serviceType: "container_yard",
         rateType: normalizeRateType(rateType),
         shippingLine,
-        isCMASpecialClient: Boolean(cmaMatch.isCMA),
-        cmaClient: cmaMatch.cmaClient?._id || null,
-        cmaIdentificationSource: cmaMatch.source || "none",
-        cmaIdentifiedAt: cmaMatch.isCMA ? new Date() : null,
-        cmaIdentifiedBy: null,
-        loloPaymentStage: cmaMatch.isCMA ? "gate_out" : "gate_out",
         truckPlateNumber: truckPlateNumber || "",
         driverName: driverName || "",
         driverLicenseNumber: driverLicenseNumber || "",
@@ -1654,7 +1634,6 @@ const createClientBooking = async (req, res) => {
         ],
     });
     await booking.populate("client", "name email companyName phoneNumber");
-    await booking.populate("cmaClient", "name code");
     const payload = safeBooking(booking);
     (0, socket_js_1.emitToAdmins)("booking:submitted", payload);
     (0, socket_js_1.emitToUser)(req.user._id, "booking:submitted", payload);
@@ -1718,10 +1697,6 @@ const resubmitClientBooking = async (req, res) => {
     booking.serviceType = "container_yard";
     booking.rateType = normalizeRateType(rateType);
     booking.shippingLine = shippingLine;
-    if (booking.cmaIdentificationSource !== "manual") {
-        const cmaMatch = await (0, cmaService_js_1.resolveCMAClientForBooking)({ clientId: booking.client, shippingLine: booking.shippingLine });
-        (0, cmaService_js_1.applyCMAIdentity)(booking, cmaMatch, req.user._id);
-    }
     booking.truckPlateNumber = truckPlateNumber || "";
     booking.driverName = driverName || "";
     booking.driverLicenseNumber = driverLicenseNumber || "";
@@ -1751,7 +1726,6 @@ const resubmitClientBooking = async (req, res) => {
     if (previousBlockId)
         await recalculateBlockOccupancy(previousBlockId);
     await booking.populate("client", "name email companyName phoneNumber");
-    await booking.populate("cmaClient", "name code");
     const payload = safeBooking(booking);
     (0, socket_js_1.emitToAdmins)("booking:resubmitted", payload);
     (0, socket_js_1.emitToUser)(req.user._id, "booking:resubmitted", payload);
@@ -1767,7 +1741,22 @@ const resubmitClientBooking = async (req, res) => {
     return res.json({ success: true, message: "Booking resubmitted. Please wait for admin approval.", booking: payload });
 };
 exports.resubmitClientBooking = resubmitClientBooking;
+const clientBookingSummary = require("../utils/clientBookingSummary.js");
 const listClientBookings = async (req, res) => {
+    // Opt-in response: never change the legacy full-list contract for other consumers.
+    if (req.query.view === "summary") {
+        const bookings = await Booking_js_1.default.find({ client: req.user._id })
+            .select(clientBookingSummary.CLIENT_BOOKING_SUMMARY_SELECT)
+            .populate("assignedArea", "name")
+            .sort({ createdAt: -1 })
+            .limit(300)
+            .lean();
+        return res.json({
+            success: true,
+            bookings: bookings.map((booking) =>
+                clientBookingSummary.toClientBookingSummary(safeBooking(booking))),
+        });
+    }
     const bookings = await populateBooking(Booking_js_1.default.find({ client: req.user._id })).sort({ createdAt: -1 }).limit(300).lean();
     return res.json({ success: true, bookings: bookings.map(safeBooking) });
 };
@@ -1785,8 +1774,10 @@ const listAdminBookings = async (req, res) => {
     const query = {};
     if (clientId && clientId !== "all")
         query.client = clientId;
-    if (status && status !== "all")
-        query.status = status;
+    if (status && status !== "all") {
+        const statuses = String(status).split(",").map((item) => item.trim()).filter(Boolean);
+        query.status = statuses.length > 1 ? { $in: statuses } : statuses[0];
+    }
     if (billingStatus && billingStatus !== "all")
         query.billingStatus = billingStatus;
     if (["empty", "laden"].includes(String(loadStatus || "").toLowerCase()))
@@ -1813,14 +1804,30 @@ const listAdminBookings = async (req, res) => {
             { shippingLine: { $regex: term, $options: "i" } },
         ];
     }
-    const hasPaging = req.query.page !== undefined || req.query.limit !== undefined || req.query.pageSize !== undefined;
     const page = Math.max(Number(req.query.page) || 1, 1);
-    const limit = Math.min(Math.max(Number(req.query.limit || req.query.pageSize) || 20, 1), 100);
-    const findQuery = populateBooking(Booking_js_1.default.find(query)).sort({ createdAt: -1 });
-    if (hasPaging) findQuery.skip((page - 1) * limit).limit(limit);
-    else findQuery.limit(300);
+    const limit = Math.min(Math.max(Number(req.query.limit || req.query.pageSize) || 10, 1), 100);
+    const allowedSortFields = new Set(["createdAt", "updatedAt", "inDate", "outDate", "containerNumber", "bookingReference", "status"]);
+    const sortField = allowedSortFields.has(String(req.query.sort || "")) ? String(req.query.sort) : "createdAt";
+    const sortDirection = String(req.query.order || "desc").toLowerCase() === "asc" ? 1 : -1;
+    const sortSpec = { [sortField]: sortDirection, _id: sortDirection };
+    const findQuery = populateBooking(Booking_js_1.default.find(query))
+        .sort(sortSpec)
+        .skip((page - 1) * limit)
+        .limit(limit);
     const [bookings, total] = await Promise.all([findQuery.lean(), Booking_js_1.default.countDocuments(query)]);
-    return res.json({ success: true, bookings: bookings.map(safeBooking), pagination: { page, limit, total, totalPages: Math.max(Math.ceil(total / limit), 1) } });
+    const totalPages = Math.max(Math.ceil(total / limit), 1);
+    return res.json({
+        success: true,
+        bookings: bookings.map(safeBooking),
+        pagination: {
+            page,
+            currentPage: page,
+            limit,
+            perPage: limit,
+            total,
+            totalPages,
+        },
+    });
 };
 exports.listAdminBookings = listAdminBookings;
 const getAdminBookingCalendar = async (req, res) => {
@@ -1973,26 +1980,14 @@ const approveBooking = async (req, res) => {
     booking.assignedAt = new Date();
     booking.assignedBy = req.user._id;
     booking.storageStartDate = booking.storageStartDate || booking.inDate || booking.expectedArrivalDate || booking.approvedAt;
-    const manualCmaClientId = String(req.body.cmaClientId || "").trim();
-    let cmaMatch;
-    if (manualCmaClientId) {
-        cmaMatch = await (0, cmaService_js_1.resolveCMAClientForBooking)({ clientId: booking.client, shippingLine: booking.shippingLine, manualCmaClientId });
-    }
-    else if (booking.cmaIdentificationSource === "manual" && booking.cmaClient) {
-        cmaMatch = { isCMA: true, cmaClient: booking.cmaClient, source: "manual" };
-    }
-    else {
-        cmaMatch = await (0, cmaService_js_1.resolveCMAClientForBooking)({ clientId: booking.client, shippingLine: booking.shippingLine });
-    }
-    (0, cmaService_js_1.applyCMAIdentity)(booking, cmaMatch, req.user._id);
-    const requestedLoloPaymentStage = booking.isCMASpecialClient ? "gate_out" : String(req.body.loloPaymentStage || "gate_out").trim().toLowerCase();
+    const requestedLoloPaymentStage = String(req.body.loloPaymentStage || "gate_out").trim().toLowerCase();
     if (!["gate_in", "gate_out"].includes(requestedLoloPaymentStage)) {
         return res.status(400).json({ success: false, message: "LOLO payment collection must be set to Gate-In or Gate-Out." });
     }
     booking.loloPaymentStage = requestedLoloPaymentStage;
     const assignedToCongestionArea = Boolean(plan.area.isCongestionArea);
     let congestionOption = null;
-    if (assignedToCongestionArea && !booking.isCMASpecialClient) {
+    if (assignedToCongestionArea) {
         congestionOption = await resolveCongestionSurchargeOption(booking, { requireCongestionSpace: false });
         if (!congestionOption.available || !congestionOption.rate) {
             return res.status(400).json({
@@ -2032,15 +2027,11 @@ const approveBooking = async (req, res) => {
     }
     const billingResult = await (0, exports.computeBookingBilling)(booking, { persist: true, phase: "gate_in" });
     addHistory(booking, {
-        remarks: booking.isCMASpecialClient
-            ? billingResult.hasMatchedRates
-                ? `Booking approved as CMA Special Client and assigned to ${assignedToCongestionArea ? "the designated congestion area" : "a regular yard area"}. Trucker Gate-In Documentation Fee is PHP ${billingResult.total.toLocaleString()}. LOLO, storage and other yard charges are routed to CMA Billing.`
-                : `Booking approved as CMA Special Client and assigned to ${assignedToCongestionArea ? "the designated congestion area" : "a regular yard area"}. Configure an active Documentation Fee under normal Rate Setup before Gate-In. LOLO, storage and other yard charges are routed to CMA Billing.`
-            : booking.loloPaymentStage === "gate_out"
-                ? `Booking approved and assigned to ${assignedToCongestionArea ? "the designated congestion area" : "a regular yard area"}. LOLO collection is deferred to Gate-Out. Storage, congestion, and other charges are also payable only at Gate-Out.`
-                : billingResult.hasMatchedRates
-                    ? `Booking approved and assigned to ${assignedToCongestionArea ? "the designated congestion area" : "a regular yard area"}. Gate-In LOLO billing is PHP ${billingResult.total.toLocaleString()}. Storage, congestion, and other charges will be computed and collected during Gate-Out.`
-                    : `Booking approved and assigned to ${assignedToCongestionArea ? "the designated congestion area" : "a regular yard area"}. Configure matching active Lift On and Lift Off rates before Gate-In payment and approval. Storage and other charges remain payable only at Gate-Out.`,
+        remarks: booking.loloPaymentStage === "gate_out"
+            ? `Booking approved and assigned to ${assignedToCongestionArea ? "the designated congestion area" : "a regular yard area"}. LOLO collection is deferred to Gate-Out. Storage, congestion, and other charges are also payable only at Gate-Out.`
+            : billingResult.hasMatchedRates
+                ? `Booking approved and assigned to ${assignedToCongestionArea ? "the designated congestion area" : "a regular yard area"}. Gate-In LOLO billing is PHP ${billingResult.total.toLocaleString()}. Storage, congestion, and other charges will be computed and collected during Gate-Out.`
+                : `Booking approved and assigned to ${assignedToCongestionArea ? "the designated congestion area" : "a regular yard area"}. Configure matching active Lift On and Lift Off rates before Gate-In payment and approval. Storage and other charges remain payable only at Gate-Out.`,
         changedBy: req.user._id,
     });
     await booking.save();
@@ -2050,17 +2041,14 @@ const approveBooking = async (req, res) => {
     await booking.populate("client", "name email companyName phoneNumber");
     await booking.populate("assignedArea", "name code isCongestionArea");
     await booking.populate("assignedBlock", "name code teuSlots occupiedSlots bayCount rowCount tierCount containerSize");
-    await booking.populate("cmaClient", "name code");
     const payload = safeBooking(booking);
     (0, socket_js_1.emitToAdmins)("booking:approved", payload);
     (0, socket_js_1.emitToAdmins)("yard:slot_reserved", payload);
     (0, socket_js_1.emitToAdmins)("inventory:updated", payload);
     (0, socket_js_1.emitToUser)(booking.client?._id || booking.client, "booking:approved", payload);
-    await notifyClient(booking, "Booking approved and QR generated", booking.isCMASpecialClient
-        ? "Your booking was approved as a CMA Special Client. Pay only the Documentation Fee for Gate-In. LOLO, storage and applicable yard charges are billed separately to CMA."
-        : booking.loloPaymentStage === "gate_in"
-            ? "Your booking was approved. A booking number and QR value have been generated. Your Lift On / Lift Off payment must be completed at Gate-In before the container can proceed."
-            : "Your booking was approved. A booking number and QR value have been generated. Use the tracking page to view the latest status.", [
+    await notifyClient(booking, "Booking approved and QR generated", booking.loloPaymentStage === "gate_in"
+        ? "Your booking was approved. A booking number and QR value have been generated. Your Lift On / Lift Off payment must be completed at Gate-In before the container can proceed."
+        : "Your booking was approved. A booking number and QR value have been generated. Use the tracking page to view the latest status.", [
         { label: "Booking Number", value: booking.bookingNumber },
         { label: "Container", value: booking.containerNumber },
         { label: "Driver", value: booking.driverName },
@@ -2072,11 +2060,9 @@ const approveBooking = async (req, res) => {
         qrCodeValue: booking.qrCodeValue,
         trackingUrl: getBookingTrackingUrl(booking.bookingNumber),
     });
-    return res.json({ success: true, message: booking.isCMASpecialClient
-        ? "Booking approved as CMA Special Client. Trucker Documentation Fee billing initialized; CMA yard charges are kept separate."
-        : booking.loloPaymentStage === "gate_out"
-            ? "Booking approved and yard area assigned. LOLO payment will be collected at Gate-Out."
-            : "Booking approved, yard area assigned, and Gate-In LOLO billing initialized.", booking: payload });
+    return res.json({ success: true, message: booking.loloPaymentStage === "gate_out"
+        ? "Booking approved and yard area assigned. LOLO payment will be collected at Gate-Out."
+        : "Booking approved, yard area assigned, and Gate-In LOLO billing initialized.", booking: payload });
 };
 exports.approveBooking = approveBooking;
 const rejectBooking = async (req, res) => {
@@ -2209,10 +2195,6 @@ const updateBookingGateInDetails = async (req, res) => {
     booking.containerLoadStatus = requestedLoadStatus;
     booking.rateType = requestedRateType;
     booking.shippingLine = String(req.body.shippingLine ?? booking.shippingLine ?? "").trim();
-    if (booking.cmaIdentificationSource !== "manual") {
-        const cmaMatch = await (0, cmaService_js_1.resolveCMAClientForBooking)({ clientId: booking.client, shippingLine: booking.shippingLine });
-        (0, cmaService_js_1.applyCMAIdentity)(booking, cmaMatch, req.user._id);
-    }
     booking.bookingNumber = String(req.body.bookingNumber ?? booking.bookingNumber ?? "").trim();
     booking.blNumber = String(req.body.blNumber ?? booking.blNumber ?? "").trim();
     booking.vesselVoyage = String(req.body.vesselVoyage ?? booking.vesselVoyage ?? "").trim();
@@ -2255,7 +2237,7 @@ const updateBookingGateInDetails = async (req, res) => {
     }
 
     let billingResult = null;
-    if (booking.isCMASpecialClient || getLoloPaymentStage(booking) === "gate_in") {
+    if (getLoloPaymentStage(booking) === "gate_in") {
         billingResult = await (0, exports.computeBookingBilling)(booking, { persist: true, phase: "gate_in" });
         if (Number(booking.approvedPaymentAmount || 0) > 0) {
             booking.billingStatus = Number(booking.paymentBalanceDue || 0) <= 0 ? "paid_approved" : "additional_payment_required";
@@ -2276,7 +2258,6 @@ const updateBookingGateInDetails = async (req, res) => {
     await booking.populate("client", "name email companyName phoneNumber");
     await booking.populate("assignedArea", "name code isCongestionArea");
     await booking.populate("assignedBlock", "name code teuSlots occupiedSlots bayCount rowCount tierCount containerSize");
-    await booking.populate("cmaClient", "name code");
     const payload = safeBooking(booking);
     (0, socket_js_1.emitToAdmins)("booking:gate_in_details_updated", payload);
     (0, socket_js_1.emitToAdmins)("inventory:updated", payload);
@@ -2301,10 +2282,9 @@ const approveBookingGateIn = async (req, res) => {
         return res.status(400).json({ success: false, message: "Booking has no assigned yard area." });
     }
     const loloPaymentStage = getLoloPaymentStage(booking);
-    const gateInClientPaymentRequired = booking.isCMASpecialClient || loloPaymentStage === "gate_in";
     let gateInBillingResult = null;
-    if (gateInClientPaymentRequired) {
-        if (booking.isCMASpecialClient || booking.billingStage !== "gate_in" || !Array.isArray(booking.billingLineItems) || booking.billingLineItems.length === 0) {
+    if (loloPaymentStage === "gate_in") {
+        if (booking.billingStage !== "gate_in" || !Array.isArray(booking.billingLineItems) || booking.billingLineItems.length === 0) {
             gateInBillingResult = await (0, exports.computeBookingBilling)(booking, { persist: true, phase: "gate_in" });
         }
         else {
@@ -2315,15 +2295,11 @@ const approveBookingGateIn = async (req, res) => {
             applyApprovedPaymentCredit(booking, booking.billingTotal);
         }
         if (!gateInBillingResult.hasMatchedRates || Number(gateInBillingResult.total || 0) <= 0) {
-            return res.status(400).json({ success: false, message: booking.isCMASpecialClient
-                ? "Gate-In requires an active Documentation Fee under normal Rate Setup for CMA trucker clients."
-                : "Gate-In requires active Lift On and Lift Off billing rates before approval when LOLO is collected at Gate-In." });
+            return res.status(400).json({ success: false, message: "Gate-In requires active Lift On and Lift Off billing rates before approval when LOLO is collected at Gate-In." });
         }
         if (booking.billingStatus !== "paid_approved" || Number(booking.paymentBalanceDue || 0) > 0) {
             await booking.save();
-            return res.status(403).json({ success: false, message: booking.isCMASpecialClient
-                ? `Gate-In Documentation Fee must be fully paid and approved before Gate-In. Balance due: PHP ${Number(booking.paymentBalanceDue || booking.paymentAmount || 0).toLocaleString()}.`
-                : `Gate-In LOLO payment must be fully paid and approved before Gate-In. Balance due: PHP ${Number(booking.paymentBalanceDue || booking.paymentAmount || 0).toLocaleString()}.` });
+            return res.status(403).json({ success: false, message: `Gate-In LOLO payment must be fully paid and approved before Gate-In. Balance due: PHP ${Number(booking.paymentBalanceDue || booking.paymentAmount || 0).toLocaleString()}.` });
         }
     }
     const actualContainerNumber = normalizeContainerNumber(req.body.actualContainerNumber || booking.containerNumber);
@@ -2354,32 +2330,24 @@ const approveBookingGateIn = async (req, res) => {
     booking.hauler = String(req.body.hauler || booking.hauler || "").trim();
     booking.inspectionRemarks = req.body.inspectionRemarks || "";
     addHistory(booking, {
-        remarks: booking.isCMASpecialClient
-            ? `Gate-In approved under pass ${booking.gateInPassNumber} after Documentation Fee verification. Container added to Inventory. LOLO, storage and other applicable yard charges are recorded separately under CMA Billing.`
-            : loloPaymentStage === "gate_in"
-                ? `Gate-In approved under pass ${booking.gateInPassNumber} after LOLO payment verification. Container added to Inventory and is awaiting storage confirmation.`
-                : `Gate-In approved under pass ${booking.gateInPassNumber}. LOLO payment is deferred to Gate-Out by admin selection. Container added to Inventory and is awaiting storage confirmation.`,
+        remarks: loloPaymentStage === "gate_in"
+            ? `Gate-In approved under pass ${booking.gateInPassNumber} after LOLO payment verification. Container added to Inventory and is awaiting storage confirmation.`
+            : `Gate-In approved under pass ${booking.gateInPassNumber}. LOLO payment is deferred to Gate-Out by admin selection. Container added to Inventory and is awaiting storage confirmation.`,
         changedBy: req.user._id,
     });
-    if (booking.isCMASpecialClient) {
-        await (0, cmaService_js_1.computeCMABillingForBooking)(booking, { asOf: receivedAt, stage: "gate_in", persist: true, updatedBy: req.user._id });
-    }
     await booking.save();
     await booking.populate("client", "name email companyName phoneNumber");
     await booking.populate("assignedArea", "name code isCongestionArea");
     await booking.populate("assignedBlock", "name code");
     await booking.populate("gateInApprovedBy", "name");
-    await booking.populate("cmaClient", "name code");
     const payload = safeBooking(booking);
     (0, socket_js_1.emitToAdmins)("booking:gate_in_approved", payload);
     (0, socket_js_1.emitToAdmins)("inventory:container_created", payload);
     (0, socket_js_1.emitToAdmins)("inventory:updated", payload);
     (0, socket_js_1.emitToUser)(booking.client?._id || booking.client, "booking:gate_in_approved", payload);
-    await notifyClient(booking, "Gate-In approved", booking.isCMASpecialClient
-        ? "Your Documentation Fee was verified and the container passed Gate-In inspection. It is now listed in Inventory. CMA LOLO, storage and applicable yard charges are kept in a separate CMA billing record."
-        : loloPaymentStage === "gate_in"
-            ? "Your LOLO payment was verified and the container passed Gate-In inspection. It is now listed in Inventory for storage confirmation."
-            : "The container passed Gate-In inspection. Your LOLO payment is scheduled for Gate-Out together with storage and other Gate-Out charges.", [
+    await notifyClient(booking, "Gate-In approved", loloPaymentStage === "gate_in"
+        ? "Your LOLO payment was verified and the container passed Gate-In inspection. It is now listed in Inventory for storage confirmation."
+        : "The container passed Gate-In inspection. Your LOLO payment is scheduled for Gate-Out together with storage and other Gate-Out charges.", [
         { label: "Gate-In Pass No.", value: booking.gateInPassNumber },
         { label: "Container", value: booking.containerNumber },
         { label: "Truck Plate", value: booking.truckPlateNumber },
@@ -2618,9 +2586,6 @@ const addBookingAdditionalCharge = async (req, res) => {
     const booking = await Booking_js_1.default.findById(req.params.id);
     if (!booking)
         return res.status(404).json({ success: false, message: "Booking not found." });
-    if (booking.isCMASpecialClient) {
-        return res.status(400).json({ success: false, message: "Use CMA Rates for LOLO, storage, and other CMA charges. Normal client additional charges are not allowed for CMA Special Client bookings." });
-    }
     if (!["unpaid", "payment_rejected"].includes(booking.billingStatus)) {
         return res.status(400).json({ success: false, message: "Additional charges can only be changed before payment is submitted or after a rejected payment." });
     }
@@ -2724,12 +2689,10 @@ const submitBookingPayment = async (req, res) => {
     const booking = await Booking_js_1.default.findOne({ _id: req.params.id, client: req.user._id });
     if (!booking)
         return res.status(404).json({ success: false, message: "Booking not found." });
-    const isGateInPayment = booking.status === "approved_area_assigned" && (booking.isCMASpecialClient || getLoloPaymentStage(booking) === "gate_in");
+    const isGateInPayment = booking.status === "approved_area_assigned" && getLoloPaymentStage(booking) === "gate_in";
     const isGateOutPayment = ["gate_out_requested", "gate_out_approved"].includes(booking.status) && Boolean(booking.outDate);
     if (!isGateInPayment && !isGateOutPayment) {
-        return res.status(400).json({ success: false, message: booking.isCMASpecialClient
-            ? "Documentation Fee payment is available at Gate-In after booking approval and again at Gate-Out after Date Out is submitted."
-            : getLoloPaymentStage(booking) === "gate_out" && booking.status === "approved_area_assigned" ? "LOLO payment is configured for Gate-Out for this booking. No payment is required at Gate-In." : "Payment is available for Gate-In LOLO when configured for Gate-In, or for the remaining Gate-Out balance after Date Out is submitted." });
+        return res.status(400).json({ success: false, message: getLoloPaymentStage(booking) === "gate_out" && booking.status === "approved_area_assigned" ? "LOLO payment is configured for Gate-Out for this booking. No payment is required at Gate-In." : "Payment is available for Gate-In LOLO when configured for Gate-In, or for the remaining Gate-Out balance after Date Out is submitted." });
     }
     if (["payment_submitted", "payment_under_review"].includes(booking.billingStatus)) {
         return res.status(409).json({ success: false, message: "A payment is already under review for this booking." });
@@ -2742,11 +2705,9 @@ const submitBookingPayment = async (req, res) => {
         phase: paymentStage,
     });
     if (!billingResult.hasMatchedRates) {
-        return res.status(400).json({ success: false, message: booking.isCMASpecialClient
-            ? "No active Documentation Fee rate matched this CMA booking. Please ask admin to complete the normal Rate Setup first."
-            : paymentStage === "gate_in"
-                ? "No active Lift On / Lift Off rate matched this booking. Please ask admin to complete Rate Setup first."
-                : "No active billing rate matched this booking. Please ask admin to complete Rate Setup first." });
+        return res.status(400).json({ success: false, message: paymentStage === "gate_in"
+            ? "No active Lift On / Lift Off rate matched this booking. Please ask admin to complete Rate Setup first."
+            : "No active billing rate matched this booking. Please ask admin to complete Rate Setup first." });
     }
     if (billingResult.total <= 0) {
         return res.status(400).json({ success: false, message: "Computed billing amount is zero. Please ask admin to review the rate setup." });
@@ -2782,10 +2743,10 @@ const submitBookingPayment = async (req, res) => {
         bookingReference: booking.bookingReference,
         clientId: req.user._id,
     });
-    if (paymentProofs.length === 0) {
+    if (paymentProofs.length === 0 && !clientPaymentReference) {
         return res.status(400).json({
             success: false,
-            message: "Proof of payment is required for all online payments.",
+            message: "Enter a payment reference number or upload proof of payment.",
         });
     }
     if (Number(booking.approvedPaymentAmount || 0) > 0 || (booking.paymentTransactions || []).length > 0 || booking.billingStatus === "payment_rejected") {
@@ -2809,23 +2770,18 @@ const submitBookingPayment = async (req, res) => {
     booking.paymentSubmittedAt = new Date();
     booking.paymentRejectionReason = "";
     booking.billingStatus = "payment_under_review";
-    const stageLabel = booking.isCMASpecialClient
-        ? (paymentStage === "gate_in" ? "Gate-In Documentation Fee" : "Gate-Out Documentation Fee")
-        : (paymentStage === "gate_in" ? "Gate-In LOLO" : "Gate-Out balance");
+    const stageLabel = paymentStage === "gate_in" ? "Gate-In LOLO" : "Gate-Out balance";
     addHistory(booking, {
         billingStatus: "payment_under_review",
-        remarks: booking.isCMASpecialClient
-            ? `${stageLabel} payment proof submitted by trucker client for PHP ${paymentBalanceDue.toLocaleString()}. CMA LOLO, storage and other yard charges are not included in this client transaction.`
-            : paymentStage === "gate_out"
-                ? `${stageLabel} payment proof submitted by client for PHP ${paymentBalanceDue.toLocaleString()}. Gate-Out gross bill PHP ${billingResult.total.toLocaleString()}. Gate-In LOLO payment remains a separate Gate-In transaction and is not part of the Gate-Out bill.`
-                : `${stageLabel} payment proof submitted by client for PHP ${paymentBalanceDue.toLocaleString()}. Gross bill PHP ${billingResult.total.toLocaleString()} with Gate-In payment credit applied.`,
+        remarks: paymentStage === "gate_out"
+            ? `${stageLabel} payment proof submitted by client for PHP ${paymentBalanceDue.toLocaleString()}. Gate-Out gross bill PHP ${billingResult.total.toLocaleString()}. Gate-In LOLO payment remains a separate Gate-In transaction and is not part of the Gate-Out bill.`
+            : `${stageLabel} payment proof submitted by client for PHP ${paymentBalanceDue.toLocaleString()}. Gross bill PHP ${billingResult.total.toLocaleString()} with Gate-In payment credit applied.`,
         changedBy: req.user._id,
     });
     await booking.save();
     await booking.populate("client", "name email companyName phoneNumber");
     await booking.populate("assignedArea", "name code isCongestionArea");
     await booking.populate("assignedBlock", "name code");
-    await booking.populate("cmaClient", "name code");
     const payload = safeBooking(booking);
     (0, socket_js_1.emitToAdmins)("booking:payment_submitted", payload);
     (0, socket_js_1.emitToUser)(req.user._id, "booking:payment_submitted", payload);
@@ -2843,12 +2799,10 @@ exports.submitBookingPayment = submitBookingPayment;
 const recordAdminCashPayment = async (req, res) => {
     const booking = await Booking_js_1.default.findById(req.params.id);
     if (!booking) return res.status(404).json({ success: false, message: "Booking not found." });
-    const isGateInPayment = booking.status === "approved_area_assigned" && (booking.isCMASpecialClient || getLoloPaymentStage(booking) === "gate_in");
+    const isGateInPayment = booking.status === "approved_area_assigned" && getLoloPaymentStage(booking) === "gate_in";
     const isGateOutPayment = ["gate_out_requested", "gate_out_approved"].includes(booking.status) && Boolean(booking.outDate);
     if (!isGateInPayment && !isGateOutPayment) {
-        return res.status(400).json({ success: false, message: booking.isCMASpecialClient
-            ? "CMA trucker cash payment is limited to the Documentation Fee at Gate-In or Gate-Out."
-            : getLoloPaymentStage(booking) === "gate_out" && booking.status === "approved_area_assigned" ? "LOLO payment is configured for Gate-Out for this booking. No cash payment is required at Gate-In." : "Cash payment is available for Gate-In LOLO when configured for Gate-In, or for the remaining Gate-Out balance after Date Out is submitted." });
+        return res.status(400).json({ success: false, message: getLoloPaymentStage(booking) === "gate_out" && booking.status === "approved_area_assigned" ? "LOLO payment is configured for Gate-Out for this booking. No cash payment is required at Gate-In." : "Cash payment is available for Gate-In LOLO when configured for Gate-In, or for the remaining Gate-Out balance after Date Out is submitted." });
     }
     // Gate-In and Gate-Out are separate billing transactions. When a container
     // reaches Gate-Out, always rebuild the Gate-Out bill so storage is computed
@@ -2883,9 +2837,6 @@ const recordAdminCashPayment = async (req, res) => {
     }
     const paymentStage = isGateInPayment ? "gate_in" : "gate_out";
     const rawAdditionalItems = Array.isArray(req.body.additionalItems) ? req.body.additionalItems : [];
-    if (booking.isCMASpecialClient && rawAdditionalItems.length > 0) {
-        return res.status(400).json({ success: false, message: "CMA trucker payments may contain Documentation Fee only. Configure LOLO, storage and other charges in CMA Rates / CMA Billing instead." });
-    }
     if (paymentStage === "gate_in" && rawAdditionalItems.length > 0) {
         return res.status(400).json({ success: false, message: "Gate-In cash payment is limited to Lift On / Lift Off charges. Add storage and other charges during Gate-Out." });
     }
@@ -2933,11 +2884,9 @@ const recordAdminCashPayment = async (req, res) => {
         phase: paymentStage,
     });
     if (!billingResult.hasMatchedRates || billingResult.total <= 0) {
-        return res.status(400).json({ success: false, message: booking.isCMASpecialClient
-            ? "Configure an active Documentation Fee in normal Rate Setup before recording the CMA trucker payment."
-            : paymentStage === "gate_in"
-                ? "Configure active Lift On / Lift Off rates before recording Gate-In cash payment."
-                : "Complete Rate Setup before recording the cash payment." });
+        return res.status(400).json({ success: false, message: paymentStage === "gate_in"
+            ? "Configure active Lift On / Lift Off rates before recording Gate-In cash payment."
+            : "Complete Rate Setup before recording the cash payment." });
     }
     const paymentBalanceDue = paymentStage === "gate_out"
         ? applyGateOutPaymentBalance(booking, billingResult.total).balanceDue
@@ -3001,9 +2950,7 @@ const recordAdminCashPayment = async (req, res) => {
     const addedItemsHistory = additionalItems.length > 0
         ? ` Added ${additionalItems.length} additional item${additionalItems.length === 1 ? "" : "s"} worth PHP ${additionalItems.reduce((sum, item) => sum + item.amount, 0).toLocaleString()}.`
         : "";
-    const stageLabel = booking.isCMASpecialClient
-        ? (paymentStage === "gate_in" ? "Gate-In Documentation Fee" : "Gate-Out Documentation Fee")
-        : (paymentStage === "gate_in" ? "Gate-In LOLO" : "Gate-Out");
+    const stageLabel = paymentStage === "gate_in" ? "Gate-In LOLO" : "Gate-Out";
     addHistory(booking, {
         billingStatus: "paid_approved",
         remarks: `${stageLabel} cash payment recorded.${addedItemsHistory} Received PHP ${cashReceived.toLocaleString()}, change PHP ${changeAmount.toLocaleString()}. Receipt ${booking.receiptNumber}.`,
@@ -3013,26 +2960,21 @@ const recordAdminCashPayment = async (req, res) => {
     await booking.populate("client", "name email companyName phoneNumber");
     await booking.populate("assignedArea", "name code isCongestionArea");
     await booking.populate("assignedBlock", "name code");
-    await booking.populate("cmaClient", "name code");
     const payload = safeBooking(booking);
     (0, socket_js_1.emitToAdmins)("booking:cash_payment_recorded", payload);
     (0, socket_js_1.emitToUser)(booking.client?._id || booking.client, "booking:cash_payment_recorded", payload);
-    await notifyClient(booking, `${stageLabel} cash payment recorded`, booking.isCMASpecialClient
-        ? "Your Documentation Fee cash payment was recorded and approved. CMA LOLO, storage and other yard charges remain separate from your client billing."
-        : paymentStage === "gate_in"
-            ? "Your Lift On / Lift Off cash payment was recorded and approved. The container can proceed to Gate-In inspection."
-            : "Your cash payment was recorded and approved. Gate-Out processing can continue.", [
+    await notifyClient(booking, `${stageLabel} cash payment recorded`, paymentStage === "gate_in"
+        ? "Your Lift On / Lift Off cash payment was recorded and approved. The container can proceed to Gate-In inspection."
+        : "Your cash payment was recorded and approved. Gate-Out processing can continue.", [
         { label: "Payment Reference", value: booking.paymentReferenceNumber },
         { label: "Amount", value: `PHP ${paymentBalanceDue.toLocaleString()}` },
         { label: "Total Approved Payment", value: `PHP ${booking.approvedPaymentAmount.toLocaleString()}` },
     ]);
     return res.json({
         success: true,
-        message: booking.isCMASpecialClient
-            ? `${stageLabel} cash payment recorded and receipt generated.`
-            : paymentStage === "gate_in"
-                ? "Gate-In LOLO cash payment recorded and receipt generated."
-                : "Gate-Out cash payment recorded and receipt generated.",
+        message: paymentStage === "gate_in"
+            ? "Gate-In LOLO cash payment recorded and receipt generated."
+            : "Gate-Out cash payment recorded and receipt generated.",
         booking: payload,
         receipt: { number: booking.receiptNumber, type: booking.receiptType, cashReceived, changeAmount },
     });
@@ -3073,18 +3015,13 @@ const approveBookingPayment = async (req, res) => {
     await booking.populate("client", "name email companyName phoneNumber");
     await booking.populate("assignedArea", "name code isCongestionArea");
     await booking.populate("assignedBlock", "name code");
-    await booking.populate("cmaClient", "name code");
     const payload = safeBooking(booking);
     (0, socket_js_1.emitToAdmins)("booking:payment_approved", payload);
     (0, socket_js_1.emitToUser)(booking.client?._id || booking.client, "booking:payment_approved", payload);
-    const approvedStageLabel = booking.isCMASpecialClient
-        ? (booking.billingStage === "gate_in" ? "Gate-In Documentation Fee" : "Gate-Out Documentation Fee")
-        : (booking.billingStage === "gate_in" ? "Gate-In LOLO" : "Gate-Out");
-    await notifyClient(booking, `${approvedStageLabel} payment approved`, booking.isCMASpecialClient
-        ? "Your Documentation Fee payment has been approved. CMA LOLO, storage and other yard charges are handled separately."
-        : booking.billingStage === "gate_in"
-            ? "Your Lift On / Lift Off payment has been approved. The container can now proceed to Gate-In inspection."
-            : "Your payment has been approved. Admin can now continue the Gate-Out release process.", [
+    const approvedStageLabel = booking.billingStage === "gate_in" ? "Gate-In LOLO" : "Gate-Out";
+    await notifyClient(booking, `${approvedStageLabel} payment approved`, booking.billingStage === "gate_in"
+        ? "Your Lift On / Lift Off payment has been approved. The container can now proceed to Gate-In inspection."
+        : "Your payment has been approved. Admin can now continue the Gate-Out release process.", [
         { label: "Payment Reference", value: booking.paymentReferenceNumber },
     ]);
     return res.json({ success: true, message: `${approvedStageLabel} payment approved.`, booking: payload });
@@ -3275,27 +3212,14 @@ const processBookingGateOutRequest = async ({ booking, req, res, requestedBy = "
     booking.gateOutRateEffectiveAt = booking.gateOutRateEffectiveAt || booking.gateOutRequestedAt;
     const billingResult = await (0, exports.computeBookingBilling)(booking, { asOf: gateOutDate.outDate, persist: true, phase: "gate_out" });
     if (!billingResult.hasMatchedRates) {
-        return res.status(400).json({ success: false, message: booking.isCMASpecialClient
-            ? (requestedBy === "admin" ? "No active Documentation Fee matched this CMA booking. Complete the normal Rate Setup first." : "No active Documentation Fee matched this CMA booking. Please ask admin to complete Rate Setup first.")
-            : requestedBy === "admin"
-                ? "No active billing rate matched this booking. Please complete Rate Setup first."
-                : "No active billing rate matched this booking. Please ask admin to complete Rate Setup first." });
+        return res.status(400).json({ success: false, message: requestedBy === "admin"
+            ? "No active billing rate matched this booking. Please complete Rate Setup first."
+            : "No active billing rate matched this booking. Please ask admin to complete Rate Setup first." });
     }
     if (billingResult.total <= 0) {
-        return res.status(400).json({ success: false, message: booking.isCMASpecialClient
-            ? "The CMA trucker Documentation Fee computed to zero. Please review the normal Rate Setup."
-            : requestedBy === "admin"
-                ? "Computed billing amount is zero. Please review the rate setup."
-                : "Computed billing amount is zero. Please ask admin to review the rate setup." });
-    }
-    let cmaBillingResult = null;
-    if (booking.isCMASpecialClient) {
-        cmaBillingResult = await (0, cmaService_js_1.computeCMABillingForBooking)(booking, { asOf: gateOutDate.outDate, stage: "gate_out", persist: true, updatedBy: req.user._id });
-        if (!cmaBillingResult.hasMatchedRates || !cmaBillingResult.lineItems.length) {
-            return res.status(400).json({ success: false, message: requestedBy === "admin"
-                ? "CMA LOLO / Storage rates are not configured for this booking. Complete CMA Rates before Gate-Out."
-                : "CMA billing is not configured for this booking yet. Please ask admin to complete CMA Rates before Gate-Out." });
-        }
+        return res.status(400).json({ success: false, message: requestedBy === "admin"
+            ? "Computed billing amount is zero. Please review the rate setup."
+            : "Computed billing amount is zero. Please ask admin to review the rate setup." });
     }
     // Gate-Out is a new transaction. Do not deduct the previously paid
     // Gate-In LOLO amount; the Gate-Out balance is the full Gate-Out bill.
@@ -3311,27 +3235,22 @@ const processBookingGateOutRequest = async ({ booking, req, res, requestedBy = "
     booking.gateOutRequestRemarks = req.body.remarks || "";
     const requesterLabel = requestedBy === "admin" ? "admin from Inventory" : "client";
     addHistory(booking, {
-        remarks: booking.isCMASpecialClient
-            ? `Gate-out requested by ${requesterLabel} for ${gateOutDate.outDate.toLocaleString()}. Trucker Gate-Out Documentation Fee is PHP ${billingResult.total.toLocaleString()}. CMA LOLO, storage and other applicable charges are recorded separately under CMA Billing${cmaBillingResult ? ` (PHP ${cmaBillingResult.total.toLocaleString()})` : ""}.`
-            : `Gate-out requested by ${requesterLabel} for ${gateOutDate.outDate.toLocaleString()}. ${getLoloPaymentStage(booking) === "gate_out" ? "LOLO is collected in this Gate-Out bill together with storage and other charges." : "Previously approved Gate-In LOLO payment remains a separate Gate-In transaction and is not deducted from the Gate-Out bill."} Gross Gate-Out bill PHP ${billingResult.total.toLocaleString()}, Gate-Out balance due PHP ${gateOutBalanceDue.toLocaleString()}, using ${billingResult.days} calendar billing day${billingResult.days === 1 ? "" : "s"}.`,
+        remarks: `Gate-out requested by ${requesterLabel} for ${gateOutDate.outDate.toLocaleString()}. ${getLoloPaymentStage(booking) === "gate_out" ? "LOLO is collected in this Gate-Out bill together with storage and other charges." : "Previously approved Gate-In LOLO payment remains a separate Gate-In transaction and is not deducted from the Gate-Out bill."} Gross Gate-Out bill PHP ${billingResult.total.toLocaleString()}, Gate-Out balance due PHP ${gateOutBalanceDue.toLocaleString()}, using ${billingResult.days} calendar billing day${billingResult.days === 1 ? "" : "s"}.`,
         changedBy: req.user._id,
     });
     await booking.save();
     await booking.populate("client", "name email companyName phoneNumber");
     await booking.populate("assignedArea", "name code isCongestionArea");
     await booking.populate("assignedBlock", "name code");
-    await booking.populate("cmaClient", "name code");
     const payload = safeBooking(booking);
     (0, socket_js_1.emitToAdmins)("booking:gate_out_requested", payload);
     (0, socket_js_1.emitToUser)(clientUserId, "booking:gate_out_requested", payload);
     await notifyClient(
         booking,
         requestedBy === "admin" ? "Gate-out scheduled by yard administrator" : "Gate-out date submitted",
-        booking.isCMASpecialClient
-            ? "Your Gate-Out was submitted. You only need to pay the Gate-Out Documentation Fee. LOLO, storage and other applicable yard charges are recorded separately to CMA and will not appear as your payable client charges."
-            : requestedBy === "admin"
-                ? "Your container Gate-Out was initiated from Inventory. The Gate-Out transaction is billed separately, including applicable storage and other Gate-Out charges."
-                : "Your Date Out was submitted. The Gate-Out transaction is billed separately, including applicable storage and other Gate-Out charges. Any Gate-In LOLO payment remains recorded under the separate Gate-In transaction.",
+        requestedBy === "admin"
+            ? "Your container Gate-Out was initiated from Inventory. The Gate-Out transaction is billed separately, including applicable storage and other Gate-Out charges."
+            : "Your Date Out was submitted. The Gate-Out transaction is billed separately, including applicable storage and other Gate-Out charges. Any Gate-In LOLO payment remains recorded under the separate Gate-In transaction.",
         [
             { label: "Container", value: booking.containerNumber },
             { label: "Date Out", value: booking.outDate ? booking.outDate.toLocaleString() : "-" },
@@ -3353,11 +3272,9 @@ const processBookingGateOutRequest = async ({ booking, req, res, requestedBy = "
     );
     return res.json({
         success: true,
-        message: booking.isCMASpecialClient
-            ? "Gate-out request submitted. Trucker Documentation Fee is ready for payment; CMA LOLO / storage charges are recorded in the separate CMA Billing module."
-            : requestedBy === "admin"
-                ? "Gate-out initiated from Inventory. The Gate-Out billing transaction is now ready for payment and approval."
-                : "Gate-out request submitted. The separate Gate-Out transaction, including applicable storage charges, is ready for payment.",
+        message: requestedBy === "admin"
+            ? "Gate-out initiated from Inventory. The Gate-Out billing transaction is now ready for payment and approval."
+            : "Gate-out request submitted. The separate Gate-Out transaction, including applicable storage charges, is ready for payment.",
         booking: payload,
     });
 };
@@ -3927,17 +3844,7 @@ const completeBookingGateOut = async (req, res) => {
         }
     }
     if (booking.billingStatus !== "paid_approved") {
-        return res.status(403).json({ success: false, message: booking.isCMASpecialClient
-            ? "The trucker Documentation Fee must be paid / approved before release completion."
-            : "Payment must be paid / approved before release completion." });
-    }
-    if (booking.isCMASpecialClient) {
-        try {
-            await (0, cmaService_js_1.ensureCMABillingRecorded)(booking, { updatedBy: req.user._id });
-        }
-        catch (error) {
-            return handleValidationError(error, res);
-        }
+        return res.status(403).json({ success: false, message: "Payment must be paid / approved before release completion." });
     }
     const actualContainerNumber = normalizeContainerNumber(req.body.actualContainerNumber || booking.containerNumber);
     if (actualContainerNumber !== booking.containerNumber) {
@@ -3966,9 +3873,7 @@ const completeBookingGateOut = async (req, res) => {
     booking.gateOutConditions = gateOutConditions.length ? gateOutConditions : normalizeConditionSelections(booking.gateInConditions || ["GOOD"]);
     booking.gateOutConditionOther = gateOutConditionOther;
     if (!wasAlreadyCompleted) {
-        addHistory(booking, { remarks: booking.isCMASpecialClient
-            ? `Container released after trucker Documentation Fee requirements were satisfied and CMA LOLO / Storage charges were recorded in CMA Billing. Client payment history remains Docs Fee only.`
-            : `Container released, final report generated, and PHP ${completedTotalPaidAmount.toLocaleString()} revenue recorded from approved Gate-In and Gate-Out payments.`, changedBy: req.user._id });
+        addHistory(booking, { remarks: `Container released, final report generated, and PHP ${completedTotalPaidAmount.toLocaleString()} revenue recorded from approved Gate-In and Gate-Out payments.`, changedBy: req.user._id });
     }
     await booking.save();
     const reportNumber = `REL-${booking.bookingReference}`;
@@ -4018,7 +3923,6 @@ const completeBookingGateOut = async (req, res) => {
     await booking.populate("assignedBlock", "name code");
     await booking.populate("gateOutApprovedBy", "name");
     await booking.populate("releasedBy", "name");
-    await booking.populate("cmaClient", "name code");
     const payload = safeBooking(booking);
     (0, socket_js_1.emitToAdmins)("booking:completed", payload);
     (0, socket_js_1.emitToAdmins)("report:generated", { booking: payload, reportId: String(releaseReport._id), reportNumber, revenue: releaseReport.revenueTotal });
