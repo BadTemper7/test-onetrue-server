@@ -48,7 +48,10 @@ const getInventoryModuleData = async (req, res) => {
         ...req,
         query: {
             ...req.query,
-            includeStats: includeMeta ? "true" : String(req.query.includeStats || "false"),
+            // Storage Monitoring has a dedicated occupancy summary; do not
+            // trigger the unrelated Inventory dashboard stats aggregation.
+            includeStats: includeMeta && String(req.query.view || "").toLowerCase() !== "storage"
+                ? "true" : String(req.query.includeStats || "false"),
         },
     };
     const tablePromise = captureController(inventoryController.listInventoryContainers, tableReq);
