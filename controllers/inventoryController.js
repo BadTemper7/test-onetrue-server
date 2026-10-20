@@ -165,7 +165,6 @@ const recalculateBlockOccupancy = async (blockId) => {
 const safeBookingContainer = (booking) => {
     const doc = booking.toObject ? booking.toObject() : booking;
     const client = doc.client || {};
-    const cmaClient = doc.cmaClient || null;
     const area = doc.assignedArea || null;
     const block = doc.assignedBlock || null;
     const legacyRegisteredBy = doc.legacyRegisteredBy || null;
@@ -198,11 +197,6 @@ const safeBookingContainer = (booking) => {
         containerLoadStatus: doc.containerLoadStatus,
         rateType: normalizeRateType(doc.rateType),
         shippingLine: doc.shippingLine,
-        isCMASpecialClient: Boolean(doc.isCMASpecialClient),
-        cmaClient: cmaClient?._id ? String(cmaClient._id) : doc.cmaClient ? String(doc.cmaClient) : "",
-        cmaClientName: cmaClient?.name || "",
-        cmaClientCode: cmaClient?.code || "",
-        cmaIdentificationSource: doc.cmaIdentificationSource || "none",
         bookingNumber: doc.bookingNumber || "",
         blNumber: doc.blNumber || "",
         customerName: client.companyName || client.name || "",
@@ -305,6 +299,41 @@ const safeContainer = (container) => {
         updatedAt: doc.updatedAt,
     };
 };
+// Keep the 3D allocation payload small. Full booking and inventory details are
+// still returned for the paginated table and its detail modal.
+const safeVisualBookingContainer = (doc) => ({
+    id: String(doc._id),
+    area: doc.assignedArea ? String(doc.assignedArea) : "",
+    block: doc.assignedBlock ? String(doc.assignedBlock) : "",
+    bay: Number(doc.assignedBay) || 1,
+    row: Number(doc.assignedRow) || 1,
+    tier: Number(doc.assignedTier) || 1,
+    containerNumber: doc.containerNumber,
+    containerSize: doc.containerSize,
+    containerLoadStatus: doc.containerLoadStatus,
+    rateType: doc.rateType,
+    clientName: doc.client?.companyName || doc.client?.name || "",
+    storageStartDate: doc.storageStartDate,
+    storedAt: doc.storedAt,
+    updatedAt: doc.updatedAt,
+});
+const safeVisualLegacyContainer = (doc) => ({
+    id: String(doc._id),
+    area: doc.area ? String(doc.area) : "",
+    block: doc.block ? String(doc.block) : "",
+    bay: Number(doc.bay) || 1,
+    row: Number(doc.row) || 1,
+    tier: Number(doc.tier) || 1,
+    containerNumber: doc.containerNumber,
+    containerSize: doc.containerSize,
+    containerLoadStatus: doc.containerStatus,
+    rateType: doc.rateType,
+    clientName: doc.client?.companyName || doc.client?.name || doc.customerName || "",
+    storageStartDate: doc.storageStartDate,
+    storedAt: doc.storageStartDate,
+    updatedAt: doc.updatedAt,
+});
+
 const listInventoryClients = async (req, res) => {
     const clients = await User_js_1.default.find({
         userType: "client",
@@ -597,7 +626,6 @@ const INVENTORY_BOOKING_SELECT = [
     "recordSource", "legacyRegistrationNumber", "legacyRegisteredAt", "legacyRegisteredBy", "legacyRegistrationReason",
     "historicalGateInDateType", "historicalSourceReference", "billingStartMethod", "migrationDate", "openingBalanceAmount", "openingCreditAmount",
     "bookingReference", "client", "containerNumber", "containerSize", "containerType", "containerLoadStatus", "rateType", "shippingLine",
-    "isCMASpecialClient", "cmaClient", "cmaIdentificationSource", "cmaIdentifiedAt",
     "bookingNumber", "blNumber", "status", "billingStatus", "assignedArea", "assignedBlock", "assignedBay", "assignedRow", "assignedTier",
     "assignedSlotNumber", "gateInApprovedAt", "storedAt", "storageStartDate", "inDate", "expectedArrivalDate", "outDate", "releasedAt",
     "gateOutGracePeriodMinutes", "gateOutScheduleStatus", "gateOutOverstayStartedAt", "physicalCondition", "truckPlateNumber", "driverName",
@@ -675,15 +703,17 @@ const listInventoryContainers = async (req, res) => {
     const bookingQuery = { status: { $in: isStorageView ? INVENTORY_STORAGE_BOOKING_STATUSES : INVENTORY_BOOKING_STATUSES } };
     const normalizedSource = ["all", "booking", "legacy"].includes(String(source)) ? String(source) : "all";
     const normalizedLoadStatus = String(loadStatus || "").toLowerCase() === "loaded" ? "laden" : String(loadStatus || "").toLowerCase();
-    const requestedLimit = getInventoryQueryLimit(req.query.limit);
+    const page = Math.max(Number(req.query.page) || 1, 1);
+    const limit = Math.min(Math.max(Number(req.query.limit || req.query.pageSize) || 10, 1), 100);
+    const skip = (page - 1) * limit;
 
     if (clientId && clientId !== "all") {
         query.client = clientId;
         bookingQuery.client = clientId;
     }
     if (status && status !== "all") {
-        if (INVENTORY_LEGACY_STATUSES.includes(status)) query.status = status;
-        if (INVENTORY_BOOKING_STATUSES.includes(status)) bookingQuery.status = status;
+        query.status = INVENTORY_LEGACY_STATUSES.includes(status) ? status : { $in: [] };
+        bookingQuery.status = INVENTORY_BOOKING_STATUSES.includes(status) ? status : { $in: [] };
     }
     if (areaId) {
         query.area = areaId;
@@ -701,105 +731,131 @@ const listInventoryContainers = async (req, res) => {
         query.rateType = String(rateType).toLowerCase();
         bookingQuery.rateType = String(rateType).toLowerCase();
     }
-    if (recordSource && recordSource !== "all") {
-        bookingQuery.recordSource = recordSource;
-    }
+    if (recordSource && recordSource !== "all") bookingQuery.recordSource = recordSource;
+
     if (search) {
         const escaped = String(search).trim().replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
         const pattern = new RegExp(escaped, "i");
         const [matchingClients, matchingAreas] = await Promise.all([
-            User_js_1.default.find({
-                userType: "client",
-                $or: [{ name: pattern }, { companyName: pattern }, { email: pattern }],
-            }).select("_id").limit(100).lean(),
+            User_js_1.default.find({ userType: "client", $or: [{ name: pattern }, { companyName: pattern }, { email: pattern }] }).select("_id").limit(100).lean(),
             YardArea_js_1.default.find({ $or: [{ name: pattern }, { code: pattern }] }).select("_id").limit(100).lean(),
         ]);
         const clientIds = matchingClients.map((item) => item._id);
         const areaIds = matchingAreas.map((item) => item._id);
         query.$or = [
-            { containerNumber: pattern },
-            { bookingNumber: pattern },
-            { blNumber: pattern },
-            { slotNumber: pattern },
-            { shippingLine: pattern },
-            ...(clientIds.length ? [{ client: { $in: clientIds } }] : []),
-            ...(areaIds.length ? [{ area: { $in: areaIds } }] : []),
+            { containerNumber: pattern }, { bookingNumber: pattern }, { blNumber: pattern }, { slotNumber: pattern }, { shippingLine: pattern },
+            ...(clientIds.length ? [{ client: { $in: clientIds } }] : []), ...(areaIds.length ? [{ area: { $in: areaIds } }] : []),
         ];
         bookingQuery.$or = [
-            { containerNumber: pattern },
-            { bookingReference: pattern },
-            { bookingNumber: pattern },
-            { blNumber: pattern },
-            { legacyRegistrationNumber: pattern },
-            { assignedSlotNumber: pattern },
-            { shippingLine: pattern },
-            ...(clientIds.length ? [{ client: { $in: clientIds } }] : []),
-            ...(areaIds.length ? [{ assignedArea: { $in: areaIds } }] : []),
+            { containerNumber: pattern }, { bookingReference: pattern }, { bookingNumber: pattern }, { blNumber: pattern },
+            { legacyRegistrationNumber: pattern }, { assignedSlotNumber: pattern }, { shippingLine: pattern },
+            ...(clientIds.length ? [{ client: { $in: clientIds } }] : []), ...(areaIds.length ? [{ assignedArea: { $in: areaIds } }] : []),
         ];
     }
 
-    const legacyPromise = normalizedSource === "booking"
-        ? Promise.resolve([])
-        : InventoryContainer_js_1.default.find(query)
-            .populate("client", "name email companyName")
-            .populate("area", "name code")
-            .populate("block", "name code")
-            .populate("preAdvice", "preAdviceNumber status")
-            .populate("gateIn", "gateInNumber status completedAt")
-            .sort({ status: 1, createdAt: -1 })
-            .limit(requestedLimit)
-            .lean();
+    const includeLegacy = normalizedSource !== "booking";
+    const includeBookings = normalizedSource !== "legacy";
+    const [legacyTotal, bookingTotal] = await Promise.all([
+        includeLegacy ? InventoryContainer_js_1.default.countDocuments(query) : 0,
+        includeBookings ? Booking_js_1.default.countDocuments(bookingQuery) : 0,
+    ]);
+    const total = legacyTotal + bookingTotal;
 
-    const bookingSort = bookingQuery.status === "gate_in_approved"
-        ? { gateInApprovedAt: -1 }
-        : { updatedAt: -1 };
-    const bookingPromise = normalizedSource === "legacy"
-        ? Promise.resolve([])
-        : Booking_js_1.default.find(bookingQuery)
-            .select(INVENTORY_BOOKING_SELECT)
-            .populate("client", "name email companyName")
-            .populate("cmaClient", "name code")
-            .populate("assignedArea", "name code")
-            .populate("assignedBlock", "name code")
-            .populate("legacyRegisteredBy", "name")
-            .sort(bookingSort)
-            .limit(requestedLimit)
-            .lean();
-
-    // Stats are intentionally not part of the normal list request. Keeping them
-    // separate prevents a collection-wide aggregate from delaying the table.
-    const includeStats = String(req.query.includeStats || "false").toLowerCase() === "true";
-    const [containers, bookingContainers] = await Promise.all([legacyPromise, bookingPromise]);
-    let statsPayload;
-    if (normalizedSource !== "legacy" && includeStats) {
-        try {
-            statsPayload = await loadInventoryStats();
-        }
-        catch (error) {
-            console.warn("Inventory list returned without stats:", error.message);
-        }
+    let pageRefs = [];
+    if (normalizedSource === "legacy") {
+        pageRefs = await InventoryContainer_js_1.default.find(query).select("_id createdAt updatedAt").sort({ createdAt: -1, _id: -1 }).skip(skip).limit(limit).lean();
+        pageRefs = pageRefs.map((item) => ({ _id: item._id, source: "legacy" }));
+    }
+    else if (normalizedSource === "booking") {
+        pageRefs = await Booking_js_1.default.find(bookingQuery)
+            .select("_id status gateInApprovedAt storedAt storageStartDate updatedAt createdAt")
+            .sort({ gateInApprovedAt: -1, updatedAt: -1, _id: -1 })
+            .skip(skip).limit(limit).lean();
+        pageRefs = pageRefs.map((item) => ({ _id: item._id, source: "booking" }));
+    }
+    else {
+        const pipeline = [
+            { $match: query },
+            { $project: { _id: 1, source: { $literal: "legacy" }, priority: { $literal: 1 }, sortDate: { $ifNull: ["$updatedAt", "$createdAt"] } } },
+            { $unionWith: { coll: Booking_js_1.default.collection.name, pipeline: [
+                { $match: bookingQuery },
+                { $project: {
+                    _id: 1,
+                    source: { $literal: "booking" },
+                    priority: { $cond: [{ $eq: ["$status", "gate_in_approved"] }, 0, 1] },
+                    sortDate: { $ifNull: ["$gateInApprovedAt", { $ifNull: ["$storedAt", { $ifNull: ["$storageStartDate", { $ifNull: ["$updatedAt", "$createdAt"] }] }] }] },
+                } },
+            ] } },
+            { $sort: { priority: 1, sortDate: -1, _id: -1 } },
+            { $skip: skip },
+            { $limit: limit },
+        ];
+        pageRefs = await InventoryContainer_js_1.default.aggregate(pipeline);
     }
 
-    const combined = [
-        ...bookingContainers.map(safeBookingContainer),
-        ...containers.map((container) => ({ ...safeContainer(container), source: "pre_advice" })),
-    ].sort((a, b) => {
-        const aWaitingStorage = a.source === "booking" && a.bookingStatus === "gate_in_approved" ? 0 : 1;
-        const bWaitingStorage = b.source === "booking" && b.bookingStatus === "gate_in_approved" ? 0 : 1;
-        if (aWaitingStorage !== bWaitingStorage) return aWaitingStorage - bWaitingStorage;
-        const bEnteredAt = new Date(b.inventoryEnteredAt || b.gateInApprovedAt || b.storedAt || b.createdAt || 0).getTime();
-        const aEnteredAt = new Date(a.inventoryEnteredAt || a.gateInApprovedAt || a.storedAt || a.createdAt || 0).getTime();
-        return bEnteredAt - aEnteredAt;
-    });
-    const visibleLimit = requestedLimit - 1;
-    const limited = combined.slice(0, visibleLimit);
+    const legacyIds = pageRefs.filter((item) => item.source === "legacy").map((item) => item._id);
+    const bookingIds = pageRefs.filter((item) => item.source === "booking").map((item) => item._id);
+    const [containers, bookingContainers] = await Promise.all([
+        legacyIds.length ? InventoryContainer_js_1.default.find({ _id: { $in: legacyIds } })
+            .populate("client", "name email companyName").populate("area", "name code").populate("block", "name code")
+            .populate("preAdvice", "preAdviceNumber status").populate("gateIn", "gateInNumber status completedAt").lean() : [],
+        bookingIds.length ? Booking_js_1.default.find({ _id: { $in: bookingIds } }).select(INVENTORY_BOOKING_SELECT)
+            .populate("client", "name email companyName").populate("assignedArea", "name code").populate("assignedBlock", "name code")
+            .populate("legacyRegisteredBy", "name").lean() : [],
+    ]);
+    const mapped = new Map();
+    bookingContainers.forEach((item) => mapped.set(`booking:${String(item._id)}`, safeBookingContainer(item)));
+    containers.forEach((item) => mapped.set(`legacy:${String(item._id)}`, { ...safeContainer(item), source: "pre_advice" }));
+    const result = pageRefs.map((item) => mapped.get(`${item.source}:${String(item._id)}`)).filter(Boolean);
+
+    let visualContainers;
+    let visualizationTruncated = false;
+    const includeVisualization = String(req.query.includeVisualization || "false").toLowerCase() === "true" && Boolean(areaId);
+    if (includeVisualization) {
+        // The 3D yard view represents ALL physically stored containers in the
+        // selected area. Table-only filters (search, block, classification) must
+        // not remove containers from the map or make a slot look empty.
+        const visualLegacyQuery = {
+            area: areaId,
+            status: { $in: INVENTORY_STORAGE_LEGACY_STATUSES },
+        };
+        const visualBookingQuery = {
+            assignedArea: areaId,
+            status: { $in: INVENTORY_STORAGE_BOOKING_STATUSES },
+        };
+        const visualizationLimit = Math.min(Math.max(Number(req.query.visualizationLimit) || 2000, 100), 5000);
+        const [visualLegacy, visualBookings] = await Promise.all([
+            includeLegacy ? InventoryContainer_js_1.default.find(visualLegacyQuery)
+                .select("area block bay row tier containerNumber containerSize containerStatus rateType client customerName storageStartDate updatedAt")
+                .sort({ updatedAt: -1, createdAt: -1, _id: -1 })
+                .limit(visualizationLimit + 1)
+                .populate("client", "name companyName").lean() : [],
+            includeBookings ? Booking_js_1.default.find(visualBookingQuery)
+                .select("assignedArea assignedBlock assignedBay assignedRow assignedTier containerNumber containerSize containerLoadStatus rateType client storageStartDate storedAt updatedAt gateInApprovedAt")
+                .sort({ gateInApprovedAt: -1, updatedAt: -1, _id: -1 })
+                .limit(visualizationLimit + 1)
+                .populate("client", "name companyName").lean() : [],
+        ]);
+        visualizationTruncated = visualLegacy.length > visualizationLimit || visualBookings.length > visualizationLimit;
+        visualContainers = [
+            ...visualBookings.slice(0, visualizationLimit).map(safeVisualBookingContainer),
+            ...visualLegacy.slice(0, visualizationLimit).map(safeVisualLegacyContainer),
+        ];
+    }
+
+    let statsPayload;
+    if (normalizedSource !== "legacy" && String(req.query.includeStats || "false").toLowerCase() === "true") {
+        try { statsPayload = await loadInventoryStats(); }
+        catch (error) { console.warn("Inventory list returned without stats:", error.message); }
+    }
+    const totalPages = Math.max(Math.ceil(total / limit), 1);
     return res.json({
         success: true,
-        containers: limited,
+        containers: result,
+        visualContainers,
+        visualizationTruncated,
         stats: statsPayload,
-        limit: visibleLimit,
-        returned: limited.length,
-        truncated: combined.length > visibleLimit || containers.length >= requestedLimit || bookingContainers.length >= requestedLimit,
+        pagination: { page, currentPage: page, limit, perPage: limit, total, totalPages },
         source: normalizedSource,
     });
 };
